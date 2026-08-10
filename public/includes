@@ -1,0 +1,82 @@
+CACHE MANIFEST
+
+CACHE:
+index.html
+includes/cat.jpg
+includes/script.js
+includes/style.css
+src/payload.bin
+src/lapse.js
+src/loader.js
+src/main.js
+src/misc.js
+src/netctrl.js
+src/worker.js
+src/workers.js
+src/ps4/constants.js
+src/ps4/kernel.js
+src/ps4/userland.js
+src/ps4/patches/1000.bin
+src/ps4/patches/1050.bin
+src/ps4/patches/1100.bin
+src/ps4/patches/1102.bin
+src/ps4/patches/600.bin
+src/ps4/patches/620.bin
+src/ps4/patches/650.bin
+src/ps4/patches/670.bin
+src/ps4/patches/700.bin
+src/ps4/patches/750.bin
+src/ps4/patches/800.bin
+src/ps4/patches/850.bin
+src/ps4/patches/900.bin
+src/ps4/patches/903.bin
+src/ps4/patches/950.bin
+
+NETWORK:
+*
+
+<!DOCTYPE html>
+<html lang="en" manifest="cache.manifest">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CSSFontFace exploit</title>
+  <link rel="stylesheet" href="includes/style.css">
+</head>
+<body>
+
+  <h1>CSSFontFace UAF Exploit</h1>
+  <h3 id="UA">Running on:</h3>
+
+  <hr>
+
+  <div class="btn-container">
+    <form id="kernel-options">
+      <input type="radio" name="kernel" id="netctrl-exploit" value="netctrl">
+      <label for="netctrl-exploit">NetCtrl</label>
+      <input type="radio" name="kernel" id="lapse-exploit" value="lapse">
+      <label for="lapse-exploit">Lapse</label>
+    </form>
+    <button id="jeilbrek">Jeilbrek</button>
+    <div class="autoJb">
+      <label for="autoJbInput" id="autoJbLabel">Auto Jailbreak</label>
+      <input class="mt-2" id="autoJbInput" type="checkbox">
+    </div>
+  </div>
+
+  <div class="main-layout">
+    <div class="media-box">
+      <img src="includes/cat.jpg" alt="A cat staring at you">
+    </div>
+
+    <pre id="console">Ready. Awaiting execution...
+  </pre>
+
+
+  </div>
+
+  <script src="src/main.js"></script>
+  <script src="includes/script.js"></script>
+</body>
+
+</html>
